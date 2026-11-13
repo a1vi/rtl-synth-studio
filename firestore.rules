@@ -1,0 +1,196 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: deny everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidTargetLibrary(lib) {
+      return lib in ['ASAP7_7NM', 'SKY130_130NM', 'ARTIX7_FPGA'];
+    }
+
+    function isValidOptGoal(goal) {
+      return goal in ['BALANCED', 'MIN_AREA', 'MIN_DELAY'];
+    }
+
+    function isValidDesign(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+             data.description is string && data.description.size() <= 300 &&
+             data.verilogCode is string && data.verilogCode.size() >= 1 && data.verilogCode.size() <= 20000 &&
+             isValidTargetLibrary(data.targetLibrary) &&
+             isValidOptGoal(data.optimizationGoal) &&
+             data.clockPeriodNs is number && data.clockPeriodNs > 0 && data.clockPeriodNs <= 1000 &&
+             data.lastWnsNs is number && data.lastWnsNs >= -1000 && data.lastWnsNs <= 1000 &&
+             data.lastAreaUm2 is number && data.lastAreaUm2 >= 0 && data.lastAreaUm2 <= 1000000 &&
+             data.lastCellCount is int && data.lastCellCount >= 0 && data.lastCellCount <= 100000 &&
+             data.lastPowerMw is number && data.lastPowerMw >= 0 && data.lastPowerMw <= 10000;
+    }
+
+    function isValidSynthesisRun(data, userId) {
+      return data.userId is string && data.userId == userId &&
+             data.designId is string && data.designId.size() >= 1 && data.designId.size() <= 128 &&
+             data.designName is string && data.designName.size() >= 1 && data.designName.size() <= 80 &&
+             isValidTargetLibrary(data.targetLibrary) &&
+             isValidOptGoal(data.optimizationGoal) &&
+             data.clockPeriodNs is number && data.clockPeriodNs > 0 && data.clockPeriodNs <= 1000 &&
+             data.fmaxMhz is number && data.fmaxMhz >= 0 && data.fmaxMhz <= 100000 &&
+             data.wnsNs is number && data.wnsNs >= -1000 && data.wnsNs <= 1000 &&
+             data.tnsNs is number && data.tnsNs >= -100000 && data.tnsNs <= 1000 &&
+             data.areaUm2 is number && data.areaUm2 >= 0 && data.areaUm2 <= 1000000 &&
+             data.cellCount is int && data.cellCount >= 0 && data.cellCount <= 100000 &&
+             data.lutCount is int && data.lutCount >= 0 && data.lutCount <= 100000 &&
+             data.dffCount is int && data.dffCount >= 0 && data.dffCount <= 100000 &&
+             data.powerMw is number && data.powerMw >= 0 && data.powerMw <= 10000 &&
+              data.criticalPathSummary is string && data.criticalPathSummary.size() <= 500 &&
+              data.netlistVerilog is string && data.netlistVerilog.size() >= 1 && data.netlistVerilog.size() <= 40000;
+     }
+
+     function isValidWorkspaceDraft(data, userId) {
+       return data.userId is string && data.userId == userId &&
+              data.activeCloudDesignId is string && data.activeCloudDesignId.size() <= 128 &&
+              data.designName is string && data.designName.size() <= 80 &&
+              data.description is string && data.description.size() <= 300 &&
+              data.verilogCode is string && data.verilogCode.size() <= 20000 &&
+              data.sdcText is string && data.sdcText.size() <= 10000 &&
+              isValidTargetLibrary(data.targetLibrary) &&
+              isValidOptGoal(data.optimizationGoal) &&
+              data.clockPeriodNs is number && data.clockPeriodNs > 0 && data.clockPeriodNs <= 1000 &&
+              data.lastWnsNs is number && data.lastWnsNs >= -1000 && data.lastWnsNs <= 1000 &&
+              data.lastAreaUm2 is number && data.lastAreaUm2 >= 0 && data.lastAreaUm2 <= 1000000 &&
+              data.lastCellCount is int && data.lastCellCount >= 0 && data.lastCellCount <= 100000 &&
+              data.lastPowerMw is number && data.lastPowerMw >= 0 && data.lastPowerMw <= 10000;
+     }
+
+    match /users/{userId}/designs/{designId} {
+      allow get: if isOwner(userId) && isValidId(designId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(designId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'name', 'description', 'verilogCode',
+                         'targetLibrary', 'optimizationGoal', 'clockPeriodNs',
+                         'lastWnsNs', 'lastAreaUm2', 'lastCellCount', 'lastPowerMw',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'name', 'description', 'verilogCode',
+                         'targetLibrary', 'optimizationGoal', 'clockPeriodNs',
+                         'lastWnsNs', 'lastAreaUm2', 'lastCellCount', 'lastPowerMw',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().createdAt is timestamp &&
+                       incoming().createdAt <= request.time &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       isValidDesign(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(designId) &&
+                       isValidDesign(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'name', 'description', 'verilogCode',
+                         'targetLibrary', 'optimizationGoal', 'clockPeriodNs',
+                         'lastWnsNs', 'lastAreaUm2', 'lastCellCount', 'lastPowerMw',
+                         'updatedAt'
+                       ]);
+
+      allow delete: if isOwner(userId) && isValidId(designId);
+    }
+
+    match /users/{userId}/synthesisRuns/{runId} {
+      allow get: if isOwner(userId) && isValidId(runId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(runId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'designId', 'designName',
+                         'targetLibrary', 'optimizationGoal', 'clockPeriodNs',
+                         'fmaxMhz', 'wnsNs', 'tnsNs', 'areaUm2',
+                         'cellCount', 'lutCount', 'dffCount', 'powerMw',
+                         'criticalPathSummary', 'netlistVerilog', 'createdAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'designId', 'designName',
+                         'targetLibrary', 'optimizationGoal', 'clockPeriodNs',
+                         'fmaxMhz', 'wnsNs', 'tnsNs', 'areaUm2',
+                         'cellCount', 'lutCount', 'dffCount', 'powerMw',
+                         'criticalPathSummary', 'netlistVerilog', 'createdAt'
+                       ]) &&
+                       incoming().createdAt is timestamp &&
+                       incoming().createdAt <= request.time &&
+                       isValidSynthesisRun(incoming(), userId);
+
+      allow update: if false;
+      allow delete: if isOwner(userId) && isValidId(runId);
+    }
+
+    match /users/{userId}/workspace/{draftId} {
+      allow get: if isOwner(userId) && isValidId(draftId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(draftId) &&
+                       incoming().keys().hasAll([
+                         'userId', 'activeCloudDesignId', 'designName', 'description',
+                         'verilogCode', 'sdcText', 'targetLibrary', 'optimizationGoal',
+                         'clockPeriodNs', 'lastWnsNs', 'lastAreaUm2', 'lastCellCount',
+                         'lastPowerMw', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'activeCloudDesignId', 'designName', 'description',
+                         'verilogCode', 'sdcText', 'targetLibrary', 'optimizationGoal',
+                         'clockPeriodNs', 'lastWnsNs', 'lastAreaUm2', 'lastCellCount',
+                         'lastPowerMw', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().createdAt is timestamp &&
+                       incoming().createdAt <= request.time &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       isValidWorkspaceDraft(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(draftId) &&
+                       isValidWorkspaceDraft(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt is timestamp &&
+                       incoming().updatedAt <= request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'activeCloudDesignId', 'designName', 'description',
+                         'verilogCode', 'sdcText', 'targetLibrary', 'optimizationGoal',
+                         'clockPeriodNs', 'lastWnsNs', 'lastAreaUm2', 'lastCellCount',
+                         'lastPowerMw', 'updatedAt'
+                       ]);
+
+      allow delete: if isOwner(userId) && isValidId(draftId);
+    }
+  }
+}
