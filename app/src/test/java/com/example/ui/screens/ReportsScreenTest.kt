@@ -150,6 +150,7 @@ class ReportsScreenTest {
     composeTestRule.onNodeWithTag("reports_tab_sta").assertIsDisplayed()
     composeTestRule.onNodeWithTag("reports_tab_simulate").assertIsDisplayed()
     composeTestRule.onNodeWithTag("reports_tab_schematic").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("reports_tab_layout").assertIsDisplayed()
 
     composeTestRule.onNodeWithTag("reports_summary_list")
       .performScrollToNode(hasTestTag("save_ppa_snapshot_button"))
@@ -179,5 +180,57 @@ class ReportsScreenTest {
     composeTestRule.waitForIdle()
     assertEquals(firstNodeId, inspectedNodeId)
     composeTestRule.onNodeWithTag("netlist_canvas").assertIsDisplayed()
+  }
+
+  @Test
+  fun reportsScreen_displaysGdsLayoutViewerAndLayerToggles() {
+    var layoutEvent: com.example.domain.synth.RtlToGdsStageEvent? = null
+    kotlinx.coroutines.runBlocking {
+      layoutEvent = com.example.domain.synth.RtlToGdsFlowEngine.runFlow(
+        rtlSource = PresetRtlDesigns.templates.first().verilogCode,
+        designName = "counter_8bit",
+        library = TargetLibrary.SKY130_130NM,
+        goal = OptimizationGoal.BALANCED,
+        engineProfile = com.example.data.model.SynthesisEngineProfile.SILICON_FLOW,
+        clockPeriodNs = 4.0,
+        coreUtilizationPercent = 60,
+        sdcText = "",
+        stepDelayMs = 0L,
+        onProgress = {},
+      )
+    }
+    val completed = layoutEvent!!
+
+    composeTestRule.setContent {
+      RtlSynthTheme(darkTheme = true) {
+        ReportsScreen(
+          state = WorkbenchUiState(
+            designName = "counter_8bit",
+            synthesisResult = completed.synthesisResult,
+            flowStages = completed.stageStates,
+            physicalLayout = completed.layoutSnapshot,
+          ),
+          settings = AppSettings(),
+          onSaveSnapshot = {},
+          onSelectNode = {},
+          onSetCycleCount = {},
+          onCycleStimulusPattern = {},
+          onStepCustomCellValue = { _, _, _, _ -> },
+          onRunSimulation = {},
+          onRunTestbenchSimulation = {},
+          onToggleWaveformSignal = {},
+          onResetStimulus = {},
+          onNotify = {},
+        )
+      }
+    }
+
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("reports_tab_layout").performClick()
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("gds_layout_canvas").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("gds_zoom_in_button").performClick()
+    composeTestRule.onNodeWithTag("layer_toggle_MET1").performClick()
+    composeTestRule.waitForIdle()
   }
 }

@@ -30,6 +30,7 @@ data class LocalDraftSnapshot(
   val savedAtEpochMs: Long = System.currentTimeMillis(),
   val files: List<RtlFileEntry> = emptyList(),
   val activeFileId: String? = null,
+  val coreUtilizationPercent: Int = 60,
 )
 
 /**
@@ -122,6 +123,7 @@ class LocalWorkspaceStore(private val rootDir: File) {
         put("savedAtEpochMs", draft.savedAtEpochMs)
         put("activeFileId", draft.activeFileId.orEmpty())
         put("files", serializeFiles(draft.files))
+        put("coreUtilizationPercent", draft.coreUtilizationPercent)
       }
       draftFile.writeText(obj.toString())
     }
@@ -145,6 +147,7 @@ class LocalWorkspaceStore(private val rootDir: File) {
         savedAtEpochMs = obj.optLong("savedAtEpochMs", 0L),
         files = deserializeFiles(obj.optJSONArray("files")),
         activeFileId = obj.optString("activeFileId", "").ifBlank { null },
+        coreUtilizationPercent = obj.optInt("coreUtilizationPercent", 60).coerceIn(30, 85),
       )
     }.getOrNull()
   }
@@ -334,6 +337,12 @@ class LocalWorkspaceStore(private val rootDir: File) {
               createdAtMillis = createdMs,
               durationMs = obj.optLong("durationMs", 0L),
               engineId = obj.optString("engineId", SynthesisEngineProfile.SILICON_FLOW.id),
+              coreUtilizationPercent = obj.optInt("coreUtilizationPercent", 60),
+              wirelengthUm = obj.optDouble("wirelengthUm", 0.0),
+              clockSkewNs = obj.optDouble("clockSkewNs", 0.0),
+              holdSlackNs = obj.optDouble("holdSlackNs", 0.0),
+              drcViolations = obj.optInt("drcViolations", 0),
+              gdsSizeBytes = obj.optLong("gdsSizeBytes", 0L),
             )
           )
         }
@@ -367,6 +376,12 @@ class LocalWorkspaceStore(private val rootDir: File) {
             put("createdAtMillis", r.createdAtMillis)
             put("durationMs", r.durationMs)
             put("engineId", r.engineId)
+            put("coreUtilizationPercent", r.coreUtilizationPercent)
+            put("wirelengthUm", r.wirelengthUm)
+            put("clockSkewNs", r.clockSkewNs)
+            put("holdSlackNs", r.holdSlackNs)
+            put("drcViolations", r.drcViolations)
+            put("gdsSizeBytes", r.gdsSizeBytes)
           }
         )
       }

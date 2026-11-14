@@ -212,4 +212,10 @@ data class SynthesisRun(
   val createdAtMillis: Long = 0L,
   val durationMs: Long = 0L,
   val engineId: String = SynthesisEngineProfile.SILICON_FLOW.id,
+  val coreUtilizationPercent: Int = 60,
+  val wirelengthUm: Double = 0.0,
+  val clockSkewNs: Double = 0.0,
+  val holdSlackNs: Double = 0.0,
+  val drcViolations: Int = 0,
+  val gdsSizeBytes: Long = 0L,
 )

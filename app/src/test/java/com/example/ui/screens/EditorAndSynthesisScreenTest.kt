@@ -5,11 +5,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
 import com.example.data.model.AppSettings
 import com.example.data.model.OptimizationGoal
@@ -119,6 +122,11 @@ class EditorAndSynthesisScreenTest {
     assertTrue(ranSynthesis)
     composeTestRule.onNodeWithTag("editor_error_banner").assertDoesNotExist()
     composeTestRule.onNodeWithTag("editor_view_reports_button").assertIsDisplayed()
+
+    // Quick-symbol bar renders and inserts HDL tokens
+    composeTestRule.onNodeWithTag("editor_symbol_bar").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("symbol_key_;").performClick()
+    composeTestRule.waitForIdle()
   }
 
   @Test
@@ -213,23 +221,100 @@ class EditorAndSynthesisScreenTest {
           onJumpToEditor = {},
           onOpenReports = {},
           onNotify = {},
+          onDesignNameChange = { state = state.copy(designName = it) },
+          onCoreUtilizationChange = { state = state.copy(coreUtilizationPercent = it) },
         )
       }
     }
 
     composeTestRule.waitForIdle()
     composeTestRule.onNodeWithTag("synth_run_button").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("flow_stepper_card"))
+    composeTestRule.onNodeWithTag("flow_stepper_card").assertIsDisplayed()
+
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("synth_design_name_input"))
+    composeTestRule.onNodeWithTag("synth_design_name_input").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("engine_chip_YOSYS_ABC"))
     composeTestRule.onNodeWithTag("engine_chip_YOSYS_ABC").performScrollTo().performClick()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("library_chip_SKY130_130NM"))
     composeTestRule.onNodeWithTag("library_chip_SKY130_130NM").performScrollTo().performClick()
     assertEquals(SynthesisEngineProfile.YOSYS_ABC, selectedEngine)
     assertEquals(TargetLibrary.SKY130_130NM, selectedLib)
 
-    composeTestRule.onNodeWithText("Advanced SDC Timing Constraints").performScrollTo().performClick()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("utilization_slider"))
+    composeTestRule.onNodeWithTag("utilization_slider").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasText("Advanced SDC Timing Constraints"))
+    composeTestRule.onNodeWithText("Advanced SDC Timing Constraints").performClick()
     composeTestRule.waitForIdle()
-    composeTestRule.onNodeWithTag("sdc_constraints_editor").performScrollTo()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("sdc_constraints_editor"))
+    composeTestRule.onNodeWithTag("sdc_constraints_editor")
       .performTextReplacement("create_clock -name clk -period 1.50 [get_ports clk]")
-    composeTestRule.onNodeWithTag("apply_sdc_button").performScrollTo().performClick()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("apply_sdc_button"))
+    composeTestRule.onNodeWithTag("apply_sdc_button").performClick()
     composeTestRule.waitForIdle()
     assertTrue(appliedSdc.contains("-period 1.50"))
+  }
+
+  @Test
+  fun synthesisScreen_displaysKLayoutSnapshotCardAfterRun() {
+    var flowEvent: com.example.domain.synth.RtlToGdsStageEvent? = null
+    kotlinx.coroutines.runBlocking {
+      flowEvent = com.example.domain.synth.RtlToGdsFlowEngine.runFlow(
+        rtlSource = "module inv_chain(input wire a, output wire y); assign y = ~a; endmodule",
+        designName = "inv_chain",
+        library = TargetLibrary.SKY130_130NM,
+        goal = OptimizationGoal.BALANCED,
+        engineProfile = SynthesisEngineProfile.SILICON_FLOW,
+        clockPeriodNs = 4.0,
+        coreUtilizationPercent = 60,
+        sdcText = "",
+        stepDelayMs = 0L,
+        onProgress = {},
+      )
+    }
+    val completed = flowEvent!!
+    var openedReports = false
+
+    composeTestRule.setContent {
+      RtlSynthTheme(darkTheme = true) {
+        SynthesisScreen(
+          state = WorkbenchUiState(
+            designName = "inv_chain",
+            synthesisResult = completed.synthesisResult,
+            flowStages = completed.stageStates,
+            physicalLayout = completed.layoutSnapshot,
+          ),
+          onSelectTopModule = {},
+          onSelectEngine = {},
+          onSelectLibrary = {},
+          onSelectGoal = {},
+          onClockPeriodChange = {},
+          onUpdateSdc = {},
+          onResetSdc = {},
+          onRunSynthesis = {},
+          onJumpToEditor = {},
+          onOpenReports = { openedReports = true },
+          onNotify = {},
+        )
+      }
+    }
+
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("klayout_snapshot_card"))
+    composeTestRule.onNodeWithTag("klayout_snapshot_card").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("klayout_snapshot_image").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("synthesis_lazy_list")
+      .performScrollToNode(hasTestTag("klayout_open_viewer_button"))
+    composeTestRule.onNodeWithTag("klayout_open_viewer_button").performClick()
+    assertTrue(openedReports)
   }
 }

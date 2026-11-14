@@ -64,6 +64,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -153,6 +154,7 @@ fun MainWorkspaceScreen(
   val settingsState by viewModel.settings.collectAsStateWithLifecycle()
 
   val eda = LocalEdaColors.current
+  val context = LocalContext.current
   var currentTab by rememberSaveable { mutableStateOf(SynthDestination.PROJECTS) }
   val snackbarHostState = remember { SnackbarHostState() }
   val scope = rememberCoroutineScope()
@@ -174,6 +176,10 @@ fun MainWorkspaceScreen(
     onDispose {
       lifecycleOwner.lifecycle.removeObserver(observer)
     }
+  }
+
+  LaunchedEffect(workbenchState.targetLibrary) {
+    viewModel.refreshDeviceAndPdkTelemetry(context)
   }
 
   LaunchedEffect(workbenchState.statusBanner) {
@@ -400,6 +406,10 @@ fun MainWorkspaceScreen(
                 onJumpToEditor = { currentTab = SynthDestination.EDITOR },
                 onOpenReports = { currentTab = SynthDestination.REPORTS },
                 onNotify = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
+                onDesignNameChange = viewModel::updateDesignName,
+                onCoreUtilizationChange = viewModel::updateCoreUtilizationPercent,
+                onCancelFlow = viewModel::cancelRtlToGdsFlow,
+                onResumeFlow = viewModel::resumeRtlToGdsFlow,
               )
 
               SynthDestination.REPORTS -> ReportsScreen(

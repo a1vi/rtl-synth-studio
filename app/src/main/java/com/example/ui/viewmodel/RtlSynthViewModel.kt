@@ -13,24 +13,35 @@ import com.example.data.model.RtlLanguage
 import com.example.data.model.SynthesisEngineProfile
 import com.example.data.model.SynthesisRun
 import com.example.data.model.TargetLibrary
+import android.content.Context
+import com.example.domain.synth.DeviceResourceSnapshot
+import com.example.domain.synth.FlowStageId
+import com.example.domain.synth.FlowStageState
+import com.example.domain.synth.FlowStageStatus
 import com.example.domain.synth.GateNode
 import com.example.domain.synth.GateType
 import com.example.domain.synth.NetlistLayoutEngine
 import com.example.domain.synth.ParsedVerilogDesign
+import com.example.domain.synth.PdkCatalogManager
+import com.example.domain.synth.PdkPackageStatus
+import com.example.domain.synth.PhysicalLayoutSnapshot
 import com.example.domain.synth.PortDirection
 import com.example.domain.synth.PresetRtlDesigns
 import com.example.domain.synth.RtlPort
 import com.example.domain.synth.RtlPresetTemplate
 import com.example.domain.synth.RtlSimulator
 import com.example.domain.synth.RtlSynthesisEngine
+import com.example.domain.synth.RtlToGdsFlowEngine
 import com.example.domain.synth.SdcParser
 import com.example.domain.synth.SimulationResult
 import com.example.domain.synth.StimulusPattern
 import com.example.domain.synth.SynthesisReport
 import com.example.domain.synth.SynthesisResult
 import com.example.domain.synth.VerilogParseResult
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -74,6 +85,7 @@ data class WorkbenchUiState(
   val optimizationGoal: OptimizationGoal = PresetRtlDesigns.templates.first().defaultGoal,
   val synthesisEngine: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
   val clockPeriodNs: Double = PresetRtlDesigns.templates.first().defaultClockNs,
+  val coreUtilizationPercent: Int = 60,
   val sdcText: String = "",
   val files: List<RtlFileEntry> = emptyList(),
   val openTabIds: List<String> = emptyList(),
@@ -86,6 +98,12 @@ data class WorkbenchUiState(
   val synthesisProgress: Float = 1f,
   val synthesisPhaseLabel: String = "Idle",
   val lastRunDurationMs: Long = 0L,
+  val flowStages: List<FlowStageState> = RtlToGdsFlowEngine.initialStages(),
+  val flowLogLines: List<String> = emptyList(),
+  val physicalLayout: PhysicalLayoutSnapshot? = null,
+  val pdkPackageStatus: PdkPackageStatus? = null,
+  val deviceResources: DeviceResourceSnapshot? = null,
+  val canResumeFlow: Boolean = false,
   val selectedNodeId: String? = null,
   val manualNodePositions: Map<String, Offset> = emptyMap(),
   val isManualSchematic: Boolean = false,
@@ -152,6 +170,7 @@ class RtlSynthViewModel(
   private val autoSaveMutex = Mutex()
   private var dirtyForAutoSave: Boolean = false
   private var lastAutoSavedSignature: ProjectSaveSignature? = null
+  private var activeFlowJob: Job? = null
 
   private val _workbench = MutableStateFlow(createInitialState())
   val workbench: StateFlow<WorkbenchUiState> = _workbench.asStateFlow()
@@ -193,6 +212,7 @@ class RtlSynthViewModel(
         optimizationGoal = draft.optimizationGoal,
         synthesisEngine = loadedSettings.defaultEngine,
         clockPeriodNs = draft.clockPeriodNs,
+        coreUtilizationPercent = draft.coreUtilizationPercent.coerceIn(30, 85),
         autoSaveStatus = AutoSaveStatus.SAVED,
         lastAutoSavedLabel = restoredLabel,
       )
@@ -218,6 +238,7 @@ class RtlSynthViewModel(
         optimizationGoal = first.defaultGoal,
         synthesisEngine = loadedSettings.defaultEngine,
         clockPeriodNs = first.defaultClockNs,
+        coreUtilizationPercent = 60,
         autoSaveStatus = AutoSaveStatus.IDLE,
       )
     }
@@ -240,6 +261,7 @@ class RtlSynthViewModel(
         savedAtEpochMs = clockMillisProvider(),
         files = state.files,
         activeFileId = state.activeFileId,
+        coreUtilizationPercent = state.coreUtilizationPercent,
       )
     )
   }
@@ -331,6 +353,7 @@ class RtlSynthViewModel(
         savedAtEpochMs = nowMs,
         files = state.files,
         activeFileId = state.activeFileId,
+        coreUtilizationPercent = state.coreUtilizationPercent,
       )
     )
 
@@ -578,6 +601,39 @@ class RtlSynthViewModel(
         description = description.take(300),
         hasUnsavedChanges = true,
       ).also(::persistDraft)
+    }
+  }
+
+  fun updateDesignName(name: String) {
+    _workbench.update {
+      it.copy(
+        designName = name.take(80),
+        hasUnsavedChanges = true,
+      ).also(::persistDraft)
+    }
+  }
+
+  fun updateCoreUtilizationPercent(percent: Int) {
+    val clamped = percent.coerceIn(30, 85)
+    _workbench.update {
+      it.copy(
+        coreUtilizationPercent = clamped,
+        hasUnsavedChanges = true,
+      ).also(::persistDraft)
+    }
+  }
+
+  fun refreshDeviceAndPdkTelemetry(context: Context) {
+    val targetLib = _workbench.value.targetLibrary
+    viewModelScope.launch(Dispatchers.IO) {
+      val pdk = runCatching { PdkCatalogManager.ensureAndVerifyPdk(context, targetLib) }.getOrNull()
+      val res = runCatching { PdkCatalogManager.queryDeviceResources(context) }.getOrNull()
+      _workbench.update {
+        it.copy(
+          pdkPackageStatus = pdk ?: it.pdkPackageStatus,
+          deviceResources = res ?: it.deviceResources,
+        )
+      }
     }
   }
 
@@ -1170,73 +1226,165 @@ class RtlSynthViewModel(
     runSynthesis()
   }
 
-  // ==================== SYNTHESIS EXECUTION ====================
+  // ==================== SYNTHESIS & RTL-TO-GDSII EXECUTION ====================
+
+  fun cancelRtlToGdsFlow() {
+    activeFlowJob?.cancel()
+    activeFlowJob = null
+    _workbench.update { state ->
+      val updatedStages = state.flowStages.map { st ->
+        if (st.status == FlowStageStatus.RUNNING) {
+          st.copy(status = FlowStageStatus.CANCELED, headlineMetric = "Paused by user")
+        } else {
+          st
+        }
+      }
+      state.copy(
+        isSynthesizing = false,
+        canResumeFlow = updatedStages.any { it.status != FlowStageStatus.PASSED },
+        flowStages = updatedStages,
+        flowLogLines = state.flowLogLines + "[WARN] RTL-to-GDSII flow canceled by user. Press Resume to continue.",
+        synthesisPhaseLabel = "Flow Canceled (Resumable)",
+      )
+    }
+  }
+
+  fun resumeRtlToGdsFlow() {
+    val stages = _workbench.value.flowStages
+    val resumeIdx = stages.indexOfFirst { it.status != FlowStageStatus.PASSED }
+      .takeIf { it >= 0 } ?: 0
+    executeRtlToGdsFlow(startFromStageIndex = resumeIdx)
+  }
 
   fun runSynthesis() {
+    executeRtlToGdsFlow(startFromStageIndex = 0)
+  }
+
+  private fun executeRtlToGdsFlow(startFromStageIndex: Int) {
+    activeFlowJob?.cancel()
     val snapshot = _workbench.value
-    viewModelScope.launch {
+    val existingStages = if (startFromStageIndex > 0) snapshot.flowStages else RtlToGdsFlowEngine.initialStages()
+    val existingReport = if (startFromStageIndex > 0) {
+      (snapshot.synthesisResult as? SynthesisResult.Success)?.report
+    } else {
+      null
+    }
+
+    activeFlowJob = viewModelScope.launch {
       _workbench.update {
         it.copy(
           isSynthesizing = true,
-          synthesisProgress = 0.25f,
-          synthesisPhaseLabel = "Elaborating RTL & Parsing HDL...",
+          canResumeFlow = false,
+          synthesisProgress = (startFromStageIndex.toFloat() / FlowStageId.entries.size).coerceIn(0.05f, 0.95f),
+          synthesisPhaseLabel = if (startFromStageIndex == 0) {
+            "Elaborating RTL & Starting Physical Flow..."
+          } else {
+            "Resuming from Stage ${startFromStageIndex + 1}/7..."
+          },
+          flowStages = existingStages,
         )
       }
       val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(snapshot.files, snapshot.verilogCode)
-      val (parseResult, result, simResult) = withContext(Dispatchers.Default) {
-        val parsed = RtlProjectHelpers.parseLanguageAware(combinedRtl, snapshot.selectedTopModule)
-        val synth = RtlSynthesisEngine.synthesize(
-          verilogSource = combinedRtl,
-          library = snapshot.targetLibrary,
-          goal = snapshot.optimizationGoal,
-          clockPeriodNs = snapshot.clockPeriodNs,
-          topModuleName = snapshot.selectedTopModule,
-          sdcText = snapshot.sdcText,
-          engineProfile = snapshot.synthesisEngine,
-        )
-        val tbSource = snapshot.files.firstOrNull { it.language == RtlLanguage.TESTBENCH }?.content.orEmpty()
-        val tbOverrides = if (snapshot.customSimValues.isEmpty() && tbSource.isNotBlank()) {
-          RtlSimulator.parseTestbenchOverrides(tbSource, snapshot.simCycleCount)
-        } else {
-          snapshot.customSimValues
-        }
-        val sim = (parsed as? VerilogParseResult.Success)?.design?.let { design ->
-          RtlSimulator.simulate(
-            design = design,
-            cycleCount = snapshot.simCycleCount,
-            patternOverrides = snapshot.stimulusPatterns,
-            customValueOverrides = tbOverrides,
+      try {
+        val (parseResult, flowEvent, simResult) = withContext(Dispatchers.Default) {
+          val parsed = RtlProjectHelpers.parseLanguageAware(combinedRtl, snapshot.selectedTopModule)
+          val finalEvent = RtlToGdsFlowEngine.runFlow(
+            rtlSource = combinedRtl,
+            designName = snapshot.designName.ifBlank { snapshot.selectedTopModule ?: "rtl_top" },
+            library = snapshot.targetLibrary,
+            goal = snapshot.optimizationGoal,
+            engineProfile = snapshot.synthesisEngine,
+            clockPeriodNs = snapshot.clockPeriodNs,
+            coreUtilizationPercent = snapshot.coreUtilizationPercent,
+            sdcText = snapshot.sdcText,
+            topModuleOverride = snapshot.selectedTopModule,
+            existingStages = existingStages,
+            existingReport = existingReport,
+            startFromStageIndex = startFromStageIndex,
+            stepDelayMs = 0L,
+            onProgress = { progressEvent ->
+              val passedCount = progressEvent.stageStates.count { it.status == FlowStageStatus.PASSED }
+              val runningStage = progressEvent.stageStates.firstOrNull { it.status == FlowStageStatus.RUNNING }
+              _workbench.update { current ->
+                current.copy(
+                  flowStages = progressEvent.stageStates,
+                  flowLogLines = progressEvent.logLines,
+                  synthesisProgress = (passedCount.toFloat() / FlowStageId.entries.size).coerceIn(0.08f, 0.96f),
+                  synthesisPhaseLabel = runningStage?.let {
+                    "Stage ${it.id.order}/7: ${it.id.title} (${it.headlineMetric})"
+                  } ?: current.synthesisPhaseLabel,
+                )
+              }
+            },
           )
+          val tbSource = snapshot.files.firstOrNull { it.language == RtlLanguage.TESTBENCH }?.content.orEmpty()
+          val tbOverrides = if (snapshot.customSimValues.isEmpty() && tbSource.isNotBlank()) {
+            RtlSimulator.parseTestbenchOverrides(tbSource, snapshot.simCycleCount)
+          } else {
+            snapshot.customSimValues
+          }
+          val sim = (parsed as? VerilogParseResult.Success)?.design?.let { design ->
+            RtlSimulator.simulate(
+              design = design,
+              cycleCount = snapshot.simCycleCount,
+              patternOverrides = snapshot.stimulusPatterns,
+              customValueOverrides = tbOverrides,
+            )
+          }
+          Triple(parsed, finalEvent, sim)
         }
-        Triple(parsed, synth, sim)
-      }
-      val duration = (result as? SynthesisResult.Success)?.report?.synthesisDurationMs ?: 0L
-      val phaseSummary = when (result) {
-        is SynthesisResult.Success -> "Synthesis complete (${duration} ms)"
-        is SynthesisResult.Error -> "Syntax / Elaboration Error (Line ${result.line})"
-      }
-      _workbench.update { state ->
+
+        val result = flowEvent.synthesisResult ?: snapshot.synthesisResult
+        val duration = (result as? SynthesisResult.Success)?.report?.synthesisDurationMs
+          ?: flowEvent.stageStates.sumOf { it.durationMs }
+        val phaseSummary = when (result) {
+          is SynthesisResult.Success -> if (flowEvent.layoutSnapshot != null) {
+            "RTL-to-GDSII complete (${duration} ms · DRC ${flowEvent.layoutSnapshot.drcViolations})"
+          } else {
+            "Synthesis complete (${duration} ms)"
+          }
+          is SynthesisResult.Error -> "Syntax / Elaboration Error (Line ${result.line})"
+          null -> "Idle"
+        }
         val firstSelected = when (result) {
           is SynthesisResult.Success -> result.report.criticalPath.firstOrNull()?.nodeId
-          is SynthesisResult.Error -> null
+          else -> null
         }
-        state.copy(
-          parsedDesign = (parseResult as? VerilogParseResult.Success)?.design,
-          parseError = parseResult as? VerilogParseResult.Error,
-          synthesisResult = result,
-          synthesisProgress = 1f,
-          synthesisPhaseLabel = phaseSummary,
-          lastRunDurationMs = duration,
-          selectedNodeId = firstSelected,
-          manualNodePositions = emptyMap(),
-          isManualSchematic = false,
-          isSynthesizing = false,
-          simulationResult = simResult ?: state.simulationResult,
-        )
-      }
-      val report = (result as? SynthesisResult.Success)?.report
-      if (report != null && localStore != null && !snapshot.activeDesignId.isNullOrBlank()) {
-        localStore.recordLocalRun(buildRunModel(snapshot.activeDesignId, snapshot.designName, report))
+
+        _workbench.update { state ->
+          state.copy(
+            parsedDesign = (parseResult as? VerilogParseResult.Success)?.design,
+            parseError = parseResult as? VerilogParseResult.Error,
+            synthesisResult = result,
+            flowStages = flowEvent.stageStates,
+            flowLogLines = flowEvent.logLines,
+            physicalLayout = flowEvent.layoutSnapshot ?: state.physicalLayout,
+            synthesisProgress = 1f,
+            synthesisPhaseLabel = phaseSummary,
+            lastRunDurationMs = duration,
+            selectedNodeId = firstSelected,
+            manualNodePositions = emptyMap(),
+            isManualSchematic = false,
+            isSynthesizing = false,
+            canResumeFlow = result is SynthesisResult.Error,
+            simulationResult = simResult ?: state.simulationResult,
+          )
+        }
+
+        val report = (result as? SynthesisResult.Success)?.report
+        if (report != null && localStore != null && !snapshot.activeDesignId.isNullOrBlank()) {
+          localStore.recordLocalRun(
+            buildRunModel(
+              designId = snapshot.activeDesignId,
+              designName = snapshot.designName,
+              report = report,
+              layout = flowEvent.layoutSnapshot,
+              coreUtilizationPercent = snapshot.coreUtilizationPercent,
+            )
+          )
+        }
+      } catch (_: CancellationException) {
+        // Handled cleanly by cancelRtlToGdsFlow() or superseded by a newer run
       }
     }
   }
@@ -1366,7 +1514,15 @@ class RtlSynthViewModel(
 
     val savedId = localStore?.upsertLocalDesign(designPayload) ?: ""
     if (report != null) {
-      localStore?.recordLocalRun(buildRunModel(savedId, state.designName.trim(), report))
+      localStore?.recordLocalRun(
+        buildRunModel(
+          designId = savedId,
+          designName = state.designName.trim(),
+          report = report,
+          layout = state.physicalLayout,
+          coreUtilizationPercent = state.coreUtilizationPercent,
+        )
+      )
     }
     val savedTime = formatClockTime(clockMillisProvider())
     _workbench.update {
@@ -1403,6 +1559,8 @@ class RtlSynthViewModel(
       designId = state.activeDesignId ?: "preset_${state.designName}",
       designName = state.designName.trim().ifBlank { report.moduleName },
       report = report,
+      layout = state.physicalLayout,
+      coreUtilizationPercent = state.coreUtilizationPercent,
     )
     localStore?.recordLocalRun(runPayload)
     _workbench.update {
@@ -1454,7 +1612,13 @@ class RtlSynthViewModel(
     return (bytes / 1024.0).coerceAtLeast(0.1)
   }
 
-  private fun buildRunModel(designId: String, designName: String, report: SynthesisReport): SynthesisRun {
+  private fun buildRunModel(
+    designId: String,
+    designName: String,
+    report: SynthesisReport,
+    layout: PhysicalLayoutSnapshot? = null,
+    coreUtilizationPercent: Int = 60,
+  ): SynthesisRun {
     return SynthesisRun(
       designId = designId,
       designName = designName,
@@ -1473,6 +1637,12 @@ class RtlSynthViewModel(
       netlistVerilog = report.netlistVerilog,
       durationMs = report.synthesisDurationMs,
       engineId = report.engineProfile.id,
+      coreUtilizationPercent = layout?.coreUtilizationPercent ?: coreUtilizationPercent,
+      wirelengthUm = layout?.totalWirelengthUm ?: 0.0,
+      clockSkewNs = layout?.clockSkewNs ?: 0.0,
+      holdSlackNs = layout?.holdWnsNs ?: 0.0,
+      drcViolations = layout?.drcViolations ?: 0,
+      gdsSizeBytes = layout?.gdsBytes?.size?.toLong() ?: 0L,
     )
   }
 

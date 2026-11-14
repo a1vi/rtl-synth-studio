@@ -29,6 +29,8 @@ import androidx.compose.material.icons.rounded.Assessment
 import androidx.compose.material.icons.rounded.BookmarkAdd
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.FileDownload
+import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.TableChart
 import androidx.compose.material.icons.rounded.WarningAmber
@@ -66,12 +68,15 @@ import com.example.data.model.AppSettings
 import com.example.data.model.ExportFormat
 import com.example.data.model.RtlLanguage
 import com.example.domain.synth.GateType
+import com.example.domain.synth.PhysicalLayoutSnapshot
 import com.example.domain.synth.SynthesisReport
 import com.example.domain.synth.SynthesisResult
 import com.example.ui.components.EdaCompactMetric
 import com.example.ui.components.EdaSectionHeader
 import com.example.ui.components.EdaStatusPill
 import com.example.ui.components.EdaSurfaceCard
+import com.example.ui.components.ExportShareHelper
+import com.example.ui.components.GdsLayoutViewer
 import com.example.ui.components.StaTimingTableView
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.LocalEdaColors
@@ -94,7 +99,7 @@ fun ReportsScreen(
   onNotify: (String) -> Unit,
   modifier: Modifier = Modifier,
 ) {
-  var subTab by rememberSaveable { mutableIntStateOf(0) } // 0=Summary, 1=STA, 2=Simulate, 3=Schematic
+  var subTab by rememberSaveable { mutableIntStateOf(0) } // 0=Summary, 1=STA, 2=Simulate, 3=Schematic, 4=GDS Layout
 
   Column(
     modifier = modifier
@@ -102,23 +107,27 @@ fun ReportsScreen(
       .padding(horizontal = 12.dp, vertical = 10.dp),
     verticalArrangement = Arrangement.spacedBy(10.dp),
   ) {
-    // Segmented Sub-View Switcher (Summary / STA / Simulate / Schematic)
+    // Segmented Sub-View Switcher (Summary / STA / Sim / Sch / GDS)
     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
       val tabs = listOf(
-        Triple("Summary", Icons.Rounded.Assessment, "reports_tab_summary"),
+        Triple("Sum", Icons.Rounded.Assessment, "reports_tab_summary"),
         Triple("STA", Icons.Rounded.TableChart, "reports_tab_sta"),
-        Triple("Simulate", Icons.Rounded.Waves, "reports_tab_simulate"),
-        Triple("Schematic", Icons.Rounded.AccountTree, "reports_tab_schematic"),
+        Triple("Sim", Icons.Rounded.Waves, "reports_tab_simulate"),
+        Triple("Sch", Icons.Rounded.AccountTree, "reports_tab_schematic"),
+        Triple("GDS", Icons.Rounded.GridView, "reports_tab_layout"),
       )
       tabs.forEachIndexed { idx, (label, icon, tag) ->
         SegmentedButton(
           selected = subTab == idx,
           onClick = { subTab = idx },
           shape = SegmentedButtonDefaults.itemShape(idx, tabs.size),
-          icon = { Icon(icon, contentDescription = null, modifier = Modifier.size(15.dp)) },
+          icon = {},
           modifier = Modifier.testTag(tag),
         ) {
-          Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+          Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(14.dp))
+            Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+          }
         }
       }
     }
@@ -132,11 +141,13 @@ fun ReportsScreen(
         } else {
           EngineeringSummaryReportView(
             report = report,
+            layout = state.physicalLayout,
             settings = settings,
             isSaving = state.isSaving,
             onSaveSnapshot = onSaveSnapshot,
             onJumpToSta = { subTab = 1 },
             onJumpToSchematic = { subTab = 3 },
+            onJumpToLayout = { subTab = 4 },
             onNotify = onNotify,
             modifier = Modifier.weight(1f),
           )
@@ -183,6 +194,17 @@ fun ReportsScreen(
           modifier = Modifier.weight(1f),
         )
       }
+      4 -> {
+        val physicalLayout = state.physicalLayout
+        if (physicalLayout == null) {
+          EmptyReportState()
+        } else {
+          GdsLayoutViewer(
+            layout = physicalLayout,
+            modifier = Modifier.weight(1f),
+          )
+        }
+      }
     }
   }
 }
@@ -198,7 +220,7 @@ private fun EmptyReportState() {
       Icon(Icons.Rounded.Speed, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(40.dp))
       Text("No Synthesis Report Available", style = MaterialTheme.typography.titleMedium)
       Text(
-        text = "Run a clean synthesis from Editor or Synthesis to inspect PPA metrics, charts, STA tables, and gate-level schematics.",
+        text = "Run a clean RTL-to-GDSII flow from Editor or Synthesis to inspect PPA metrics, STA tables, schematics, and GDSII layout.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
       )
@@ -209,11 +231,13 @@ private fun EmptyReportState() {
 @Composable
 private fun EngineeringSummaryReportView(
   report: SynthesisReport,
+  layout: PhysicalLayoutSnapshot?,
   settings: AppSettings,
   isSaving: Boolean,
   onSaveSnapshot: () -> Unit,
   onJumpToSta: () -> Unit,
   onJumpToSchematic: () -> Unit,
+  onJumpToLayout: () -> Unit,
   onNotify: (String) -> Unit,
   modifier: Modifier = Modifier,
 ) {
@@ -464,38 +488,100 @@ private fun EngineeringSummaryReportView(
       }
     }
 
-    // 4. Snapshot & Export Controls
-    item {
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-      ) {
-        Button(
-          onClick = onSaveSnapshot,
-          enabled = !isSaving,
-          modifier = Modifier
-            .weight(1f)
-            .heightIn(min = 48.dp)
-            .testTag("save_ppa_snapshot_button"),
-        ) {
-          Icon(Icons.Rounded.BookmarkAdd, contentDescription = null, modifier = Modifier.size(18.dp))
-          Spacer(Modifier.width(6.dp))
-          Text("Save Snapshot", style = MaterialTheme.typography.labelLarge)
+    // 3b. Physical Implementation & Sign-off Card (CTS / Route / DRC / GDSII)
+    if (layout != null) {
+      item {
+        EdaSurfaceCard(modifier = Modifier.fillMaxWidth().testTag("physical_signoff_card")) {
+          Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              EdaSectionHeader(
+                title = "Physical PnR & GDSII Sign-off",
+                subtitle = "Floorplan, CTS skew, M1-M3 routing, and geometry checks",
+              )
+              EdaStatusPill(
+                text = if (layout.drcViolations == 0 && layout.lvsClean) "DRC CLEAN" else "${layout.drcViolations} DRC",
+                color = if (layout.drcViolations == 0 && layout.lvsClean) eda.success else eda.warning,
+                containerColor = if (layout.drcViolations == 0 && layout.lvsClean) eda.successContainer else eda.warningContainer,
+              )
+            }
+            StatRow("Die Footprint", "${"%.1f".format(Locale.US, layout.dieWidthUm)} × ${"%.1f".format(Locale.US, layout.dieHeightUm)} µm (${layout.rowCount} rows)")
+            StatRow("Core Density", "${layout.coreUtilizationPercent}% target · ${"%.1f".format(Locale.US, layout.actualUtilizationPercent)}% actual")
+            StatRow("Clock Skew / Hold WNS", "${"%.3f".format(Locale.US, layout.clockSkewNs)} ns · +${"%.3f".format(Locale.US, layout.holdWnsNs)} ns")
+            StatRow("Routed Wirelength & Vias", "${"%.1f".format(Locale.US, layout.totalWirelengthUm)} µm · ${layout.viaCount} vias")
+            StatRow("GDSII Mask Stream", "${layout.gdsBytes.size} B (sha256:${layout.gdsSha256.take(10)})")
+            OutlinedButton(
+              onClick = onJumpToLayout,
+              modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).testTag("open_gds_layout_button"),
+            ) {
+              Icon(Icons.Rounded.GridView, contentDescription = null, modifier = Modifier.size(18.dp))
+              Spacer(Modifier.width(6.dp))
+              Text("Open Zoomable GDSII Layout Viewer", style = MaterialTheme.typography.labelLarge)
+            }
+          }
         }
+      }
+    }
+
+    // 4. Snapshot, Export & Native Share Sheet Controls
+    item {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+          Button(
+            onClick = onSaveSnapshot,
+            enabled = !isSaving,
+            modifier = Modifier
+              .weight(1f)
+              .heightIn(min = 48.dp)
+              .testTag("save_ppa_snapshot_button"),
+          ) {
+            Icon(Icons.Rounded.BookmarkAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Save Snapshot", style = MaterialTheme.typography.labelLarge)
+          }
+          OutlinedButton(
+            onClick = {
+              val fmt = settings.defaultExportFormat
+              pendingExportContent = formatReportExport(report, fmt, settings.includeTimestampsInExport)
+              exportLauncher.launch("${report.moduleName}_report.${fmt.extension}")
+            },
+            modifier = Modifier
+              .weight(1f)
+              .heightIn(min = 48.dp)
+              .testTag("export_report_button"),
+          ) {
+            Icon(Icons.Rounded.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Export ${settings.defaultExportFormat.extension.uppercase()}", style = MaterialTheme.typography.labelLarge)
+          }
+        }
+
         OutlinedButton(
           onClick = {
-            val fmt = settings.defaultExportFormat
-            pendingExportContent = formatReportExport(report, fmt, settings.includeTimestampsInExport)
-            exportLauncher.launch("${report.moduleName}_report.${fmt.extension}")
+            ExportShareHelper.shareBuildBundle(
+              context = context,
+              report = report,
+              layout = layout,
+              onResult = onNotify,
+            )
           },
           modifier = Modifier
-            .weight(1f)
+            .fillMaxWidth()
             .heightIn(min = 48.dp)
-            .testTag("export_report_button"),
+            .testTag("share_bundle_button"),
         ) {
-          Icon(Icons.Rounded.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+          Icon(Icons.Rounded.Share, contentDescription = null, modifier = Modifier.size(18.dp))
           Spacer(Modifier.width(6.dp))
-          Text("Export ${settings.defaultExportFormat.extension.uppercase()}", style = MaterialTheme.typography.labelLarge)
+          Text("Share .gds, Netlist, Tcl & Reports", style = MaterialTheme.typography.labelLarge)
         }
       }
     }

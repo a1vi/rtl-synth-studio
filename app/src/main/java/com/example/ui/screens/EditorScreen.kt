@@ -44,6 +44,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,8 +56,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -318,6 +321,26 @@ fun EditorScreen(
       EditorCodeHelpers.checkBracketBalance(activeContent)
     }
 
+    var codeFieldValue by remember(activeFile?.id) {
+      mutableStateOf(TextFieldValue(activeContent, TextRange(activeContent.length)))
+    }
+    LaunchedEffect(activeContent) {
+      if (codeFieldValue.text != activeContent) {
+        val clampedSel = codeFieldValue.selection.start.coerceIn(0, activeContent.length)
+        codeFieldValue = TextFieldValue(activeContent, TextRange(clampedSel))
+      }
+    }
+
+    fun insertAtCursor(snippet: String) {
+      val text = codeFieldValue.text
+      val start = codeFieldValue.selection.min.coerceIn(0, text.length)
+      val end = codeFieldValue.selection.max.coerceIn(0, text.length)
+      val updated = text.substring(0, start) + snippet + text.substring(end)
+      val nextCursor = start + snippet.length
+      codeFieldValue = TextFieldValue(updated, TextRange(nextCursor))
+      onFileContentChange(updated)
+    }
+
     Surface(
       color = eda.codeSurface,
       shape = MaterialTheme.shapes.medium,
@@ -421,15 +444,24 @@ fun EditorScreen(
             .testTag("verilog_code_editor")
 
           BasicTextField(
-            value = activeContent,
+            value = codeFieldValue,
             onValueChange = { incoming ->
-              val transformed = if (settings.autoIndent) {
-                EditorCodeHelpers.applyAutoIndentOnNewline(activeContent, incoming, settings.tabWidth)
-                  ?: incoming
+              val transformedText = if (settings.autoIndent) {
+                EditorCodeHelpers.applyAutoIndentOnNewline(activeContent, incoming.text, settings.tabWidth)
               } else {
-                incoming
+                null
               }
-              onFileContentChange(transformed)
+              if (transformedText != null) {
+                val delta = transformedText.length - incoming.text.length
+                val pos = (incoming.selection.end + delta).coerceIn(0, transformedText.length)
+                codeFieldValue = TextFieldValue(transformedText, TextRange(pos))
+                onFileContentChange(transformedText)
+              } else {
+                codeFieldValue = incoming
+                if (incoming.text != activeContent) {
+                  onFileContentChange(incoming.text)
+                }
+              }
             },
             textStyle = codeStyle.copy(color = MaterialTheme.colorScheme.onSurface),
             cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
@@ -477,7 +509,40 @@ fun EditorScreen(
       }
     }
 
-    // 4. Context-Aware Code Completion Chips
+    // 4a. Mobile RTL Quick-Symbol Bar
+    val quickSymbols = remember {
+      listOf("[", "]", "{", "}", ";", "<=", "@", "=", "(", ")", ":", "'b", "'h", "'d", "// ")
+    }
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .horizontalScroll(rememberScrollState())
+        .testTag("editor_symbol_bar"),
+      horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+      quickSymbols.forEach { sym ->
+        val trimmed = sym.trim()
+        Surface(
+          onClick = { insertAtCursor(sym) },
+          color = MaterialTheme.colorScheme.surface,
+          shape = MaterialTheme.shapes.extraSmall,
+          border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = if (eda.isDark) 0.7f else 0.9f)),
+          modifier = Modifier.testTag("symbol_key_$trimmed"),
+        ) {
+          Text(
+            text = trimmed,
+            style = MaterialTheme.typography.labelMedium.copy(
+              fontFamily = JetBrainsMonoFamily,
+              fontWeight = FontWeight.SemiBold,
+            ),
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+          )
+        }
+      }
+    }
+
+    // 4b. Context-Aware Code Completion Chips
     val portAndSignalNames = remember(state.parsedDesign) {
       state.parsedDesign?.topModule?.ports?.map { it.name }.orEmpty() +
         state.parsedDesign?.topModule?.internalSignals?.map { it.name }.orEmpty()
@@ -494,10 +559,7 @@ fun EditorScreen(
     ) {
       completions.forEach { (label, snippet) ->
         Surface(
-          onClick = {
-            val separator = if (activeContent.endsWith('\n') || activeContent.isEmpty() || snippet.startsWith(" ")) "" else " "
-            onFileContentChange(activeContent + separator + snippet)
-          },
+          onClick = { insertAtCursor(snippet) },
           color = eda.elevatedCard,
           shape = MaterialTheme.shapes.extraSmall,
           border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = 0.7f)),

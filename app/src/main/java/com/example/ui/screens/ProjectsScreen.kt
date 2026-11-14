@@ -717,6 +717,12 @@ private fun CompareRunsDialog(
           fmax = r.fmaxMhz,
           wns = r.wnsNs,
           power = r.powerMw,
+          utilPercent = r.coreUtilizationPercent,
+          wirelengthUm = r.wirelengthUm,
+          clockSkewNs = r.clockSkewNs,
+          holdSlackNs = r.holdSlackNs,
+          drcViolations = r.drcViolations,
+          gdsSizeBytes = r.gdsSizeBytes,
         )
       }
     } else {
@@ -749,8 +755,17 @@ private fun CompareRunsDialog(
           CompareLine("Cells", "${a.cells}", "${b.cells}")
           CompareLine("Area (um²)", "${"%.2f".format(Locale.US, a.area)}", "${"%.2f".format(Locale.US, b.area)}")
           CompareLine("Fmax (MHz)", "${"%.1f".format(Locale.US, a.fmax)}", "${"%.1f".format(Locale.US, b.fmax)}")
-          CompareLine("WNS (ns)", formatSignedNs(a.wns), formatSignedNs(b.wns))
+          CompareLine("Setup WNS", formatSignedNs(a.wns), formatSignedNs(b.wns))
+          CompareLine("Hold WNS", formatSignedNs(a.holdSlackNs), formatSignedNs(b.holdSlackNs))
           CompareLine("Power (mW)", "${"%.3f".format(Locale.US, a.power)}", "${"%.3f".format(Locale.US, b.power)}")
+          if (a.wirelengthUm > 0.0 || b.wirelengthUm > 0.0 || a.gdsSizeBytes > 0L || b.gdsSizeBytes > 0L) {
+            HorizontalDivider()
+            CompareLine("Core Util", "${a.utilPercent}%", "${b.utilPercent}%")
+            CompareLine("Wirelength", "${"%.1f".format(Locale.US, a.wirelengthUm)} µm", "${"%.1f".format(Locale.US, b.wirelengthUm)} µm")
+            CompareLine("Clk Skew", "${"%.3f".format(Locale.US, a.clockSkewNs)} ns", "${"%.3f".format(Locale.US, b.clockSkewNs)} ns")
+            CompareLine("DRC Viol.", "${a.drcViolations}", "${b.drcViolations}")
+            CompareLine("GDS Size", "${a.gdsSizeBytes} B", "${b.gdsSizeBytes} B")
+          }
         }
       }
     },
@@ -767,6 +782,12 @@ private data class CompareMetricRow(
   val fmax: Double,
   val wns: Double,
   val power: Double,
+  val utilPercent: Int = 60,
+  val wirelengthUm: Double = 0.0,
+  val clockSkewNs: Double = 0.0,
+  val holdSlackNs: Double = 0.0,
+  val drcViolations: Int = 0,
+  val gdsSizeBytes: Long = 0L,
 )
 
 @Composable
