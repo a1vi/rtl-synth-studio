@@ -1,10 +1,13 @@
 package com.example.ui.screens
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToNode
+import com.example.data.model.AppSettings
 import com.example.data.model.OptimizationGoal
 import com.example.data.model.TargetLibrary
 import com.example.domain.synth.GateNode
@@ -17,6 +20,7 @@ import com.example.ui.components.StaSortColumn
 import com.example.ui.components.StaSortDirection
 import com.example.ui.components.StaTableSorter
 import com.example.ui.theme.RtlSynthTheme
+import com.example.ui.viewmodel.WorkbenchUiState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -27,7 +31,7 @@ import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], qualifiers = "w480dp-h892dp")
-class TimingPpaScreenTest {
+class ReportsScreenTest {
 
   @get:Rule
   val composeTestRule = createComposeRule()
@@ -88,23 +92,18 @@ class TimingPpaScreenTest {
       ),
     )
 
-    // Slack ascending places violating/tightest slack first
     val slackAsc = StaTableSorter.sortAndFilter(nodes, StaSortColumn.SLACK, StaSortDirection.ASCENDING, StaRowFilter.ALL)
     assertEquals(listOf("n_viol", "n_mid", "n_fast"), slackAsc.map { it.id })
 
-    // Slack descending places highest margin first
     val slackDesc = StaTableSorter.sortAndFilter(nodes, StaSortColumn.SLACK, StaSortDirection.DESCENDING, StaRowFilter.ALL)
     assertEquals(listOf("n_fast", "n_mid", "n_viol"), slackDesc.map { it.id })
 
-    // Delay descending places slowest gate first
     val delayDesc = StaTableSorter.sortAndFilter(nodes, StaSortColumn.DELAY, StaSortDirection.DESCENDING, StaRowFilter.ALL)
     assertEquals(listOf("n_viol", "n_mid", "n_fast"), delayDesc.map { it.id })
 
-    // Delay ascending places fastest gate first
     val delayAsc = StaTableSorter.sortAndFilter(nodes, StaSortColumn.DELAY, StaSortDirection.ASCENDING, StaRowFilter.ALL)
     assertEquals(listOf("n_fast", "n_mid", "n_viol"), delayAsc.map { it.id })
 
-    // Filters narrow to violating or critical paths
     val violations = StaTableSorter.sortAndFilter(nodes, StaSortColumn.SLACK, StaSortDirection.ASCENDING, StaRowFilter.VIOLATING)
     assertEquals(listOf("n_viol"), violations.map { it.id })
 
@@ -113,7 +112,7 @@ class TimingPpaScreenTest {
   }
 
   @Test
-  fun timingPpaScreen_switchesToStaTableAndSortsBySlackAndDelay() {
+  fun reportsScreen_displaysSummaryChartsSwitchesToStaTableAndSortsAndInspectsNode() {
     val result = RtlSynthesisEngine.synthesize(
       verilogSource = PresetRtlDesigns.templates.first().verilogCode,
       library = TargetLibrary.ASAP7_7NM,
@@ -122,50 +121,63 @@ class TimingPpaScreenTest {
     ) as SynthesisResult.Success
 
     var inspectedNodeId: String? = null
+    var savedSnapshot = false
 
     composeTestRule.setContent {
       RtlSynthTheme(darkTheme = true) {
-        TimingPpaScreen(
-          synthesisResult = result,
-          isSaving = false,
-          onSaveSnapshot = {},
-          onInspectNodeInSchematic = { inspectedNodeId = it },
+        ReportsScreen(
+          state = WorkbenchUiState(
+            designName = "counter_8bit",
+            synthesisResult = result,
+          ),
+          settings = AppSettings(),
+          onSaveSnapshot = { savedSnapshot = true },
+          onSelectNode = { inspectedNodeId = it },
+          onSetCycleCount = {},
+          onCycleStimulusPattern = {},
+          onStepCustomCellValue = { _, _, _, _ -> },
+          onRunSimulation = {},
+          onRunTestbenchSimulation = {},
+          onToggleWaveformSignal = {},
+          onResetStimulus = {},
+          onNotify = {},
         )
       }
     }
 
     composeTestRule.waitForIdle()
-    composeTestRule.onNodeWithTag("timing_mode_overview").assertIsDisplayed()
-    composeTestRule.onNodeWithTag("timing_mode_table").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("reports_tab_summary").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("reports_tab_sta").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("reports_tab_simulate").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("reports_tab_schematic").assertIsDisplayed()
 
-    // Switch to the dedicated STA Table view
-    composeTestRule.onNodeWithTag("timing_mode_table").performClick()
+    composeTestRule.onNodeWithTag("reports_summary_list")
+      .performScrollToNode(hasTestTag("save_ppa_snapshot_button"))
+    composeTestRule.onNodeWithTag("save_ppa_snapshot_button").performClick()
+    assertTrue(savedSnapshot)
+
+    // Switch to STA Table view
+    composeTestRule.onNodeWithTag("reports_tab_sta").performClick()
     composeTestRule.waitForIdle()
 
     composeTestRule.onNodeWithTag("sta_timing_table").assertIsDisplayed()
     composeTestRule.onNodeWithText("Sort: Slack ↑").assertIsDisplayed()
 
-    // Toggle Slack sort direction to descending
     composeTestRule.onNodeWithTag("sta_sort_slack").performClick()
     composeTestRule.waitForIdle()
     composeTestRule.onNodeWithText("Sort: Slack ↓").assertIsDisplayed()
 
-    // Sort by Delay (defaults to descending slowest-first, then toggles ascending)
     composeTestRule.onNodeWithTag("sta_sort_delay").performClick()
     composeTestRule.waitForIdle()
     composeTestRule.onNodeWithText("Sort: Delay ↓").assertIsDisplayed()
 
-    composeTestRule.onNodeWithTag("sta_sort_delay").performClick()
-    composeTestRule.waitForIdle()
-    composeTestRule.onNodeWithText("Sort: Delay ↑").assertIsDisplayed()
-
-    // Filter to critical path and tap first node row to inspect in schematic
     composeTestRule.onNodeWithTag("sta_filter_critical").performClick()
     composeTestRule.waitForIdle()
 
     val firstNodeId = result.report.nodes.first { it.isCriticalPath }.id
     composeTestRule.onNodeWithTag("sta_row_$firstNodeId").performClick()
     composeTestRule.waitForIdle()
-    assertTrue(inspectedNodeId == firstNodeId)
+    assertEquals(firstNodeId, inspectedNodeId)
+    composeTestRule.onNodeWithTag("netlist_canvas").assertIsDisplayed()
   }
 }

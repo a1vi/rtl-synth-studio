@@ -628,6 +628,58 @@ object RtlSimulator {
     return netValues[netName] ?: 0L
   }
 
+  /**
+   * Parses initial/#delay signal assignments from a Verilog/SystemVerilog testbench
+   * into per-(signal, cycle) stimulus overrides for interactive simulation.
+   */
+  fun parseTestbenchOverrides(
+    testbenchSource: String,
+    cycleCount: Int = 16,
+  ): Map<Pair<String, Int>, Long> {
+    if (testbenchSource.isBlank()) return emptyMap()
+    val result = mutableMapOf<Pair<String, Int>, Long>()
+    val initialMatch = Regex("""(?is)\binitial\b\s*(?:begin)?(.*?)(?:\bend\b|\z)""").find(testbenchSource)
+    val body = initialMatch?.groupValues?.get(1) ?: testbenchSource
+    var currentCycle = 0
+    val tokens = body.split(';', '\n')
+    val delayRegex = Regex("""#\s*(\d+)""")
+    val assignRegex = Regex("""^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9a-fA-FxXbBdDoOhH_'']+)""")
+    tokens.forEach { rawStmt ->
+      var stmt = rawStmt.trim()
+      if (stmt.isEmpty() || stmt.startsWith("//") || stmt.startsWith("${'$'}")) return@forEach
+      val dMatch = delayRegex.find(stmt)
+      if (dMatch != null) {
+        val ns = dMatch.groupValues[1].toIntOrNull() ?: 1
+        currentCycle = (currentCycle + (ns / 2).coerceAtLeast(1)).coerceAtMost(cycleCount - 1)
+        stmt = stmt.substring(dMatch.range.last + 1).trim()
+      }
+      val aMatch = assignRegex.find(stmt)
+      if (aMatch != null) {
+        val sig = aMatch.groupValues[1]
+        val lit = parseLiteralLong(aMatch.groupValues[2])
+        if (lit != null) {
+          for (c in currentCycle until cycleCount) {
+            result[sig to c] = lit
+          }
+        }
+      }
+    }
+    return result
+  }
+
+  private fun parseLiteralLong(raw: String): Long? {
+    val clean = raw.trim().replace("_", "")
+    clean.toLongOrNull()?.let { return it }
+    val sized = Regex("""^\d*'([bBoOdDhH])([0-9a-fA-F]+)$""").find(clean) ?: return null
+    val radix = when (sized.groupValues[1].lowercase(Locale.ROOT)) {
+      "b" -> 2
+      "o" -> 8
+      "h" -> 16
+      else -> 10
+    }
+    return sized.groupValues[2].toLongOrNull(radix)
+  }
+
   fun maskValue(value: Long, width: Int): Long {
     val safeW = width.coerceIn(1, 62)
     val mask = if (safeW >= 62) Long.MAX_VALUE else (1L shl safeW) - 1L

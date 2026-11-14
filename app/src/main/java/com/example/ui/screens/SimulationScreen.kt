@@ -55,6 +55,10 @@ import com.example.domain.synth.WaveformRadix
 import com.example.ui.components.WaveformViewer
 import com.example.ui.theme.JetBrainsMonoFamily
 
+import androidx.compose.material.icons.rounded.ZoomIn
+import androidx.compose.material.icons.rounded.ZoomOut
+import androidx.compose.runtime.mutableFloatStateOf
+
 @Composable
 fun SimulationScreen(
   simulation: SimulationResult?,
@@ -66,9 +70,14 @@ fun SimulationScreen(
   onRunSimulation: () -> Unit,
   onResetStimulus: () -> Unit,
   modifier: Modifier = Modifier,
+  selectedSignals: Set<String> = emptySet(),
+  onToggleSignal: (String) -> Unit = {},
+  hasTestbench: Boolean = false,
+  onRunTestbench: () -> Unit = {},
 ) {
   var radix by rememberSaveable { mutableStateOf(WaveformRadix.HEX) }
   var selectedCycle by rememberSaveable { mutableIntStateOf(0) }
+  var zoomScale by rememberSaveable { mutableFloatStateOf(1f) }
 
   val maxCycle = ((simulation?.cycleCount ?: cycleCount) - 1).coerceAtLeast(0)
   val safeSelectedCycle = selectedCycle.coerceIn(0, maxCycle)
@@ -185,6 +194,17 @@ fun SimulationScreen(
           Text("Simulate", style = MaterialTheme.typography.labelLarge)
         }
 
+        if (hasTestbench) {
+          OutlinedButton(
+            onClick = onRunTestbench,
+            modifier = Modifier
+              .heightIn(min = 48.dp)
+              .testTag("sim_run_tb_button"),
+          ) {
+            Text("Run TB", style = MaterialTheme.typography.labelMedium)
+          }
+        }
+
         listOf(8, 16, 24, 32).forEach { count ->
           FilterChip(
             selected = cycleCount == count,
@@ -192,6 +212,19 @@ fun SimulationScreen(
             label = { Text("${count}c", style = MaterialTheme.typography.labelMedium) },
             modifier = Modifier.testTag("sim_cycles_$count"),
           )
+        }
+
+        IconButton(
+          onClick = { zoomScale = (zoomScale - 0.25f).coerceAtLeast(0.6f) },
+          modifier = Modifier.size(44.dp).testTag("sim_zoom_out_button"),
+        ) {
+          Icon(Icons.Rounded.ZoomOut, contentDescription = "Zoom out waveform")
+        }
+        IconButton(
+          onClick = { zoomScale = (zoomScale + 0.25f).coerceAtMost(2.5f) },
+          modifier = Modifier.size(44.dp).testTag("sim_zoom_in_button"),
+        ) {
+          Icon(Icons.Rounded.ZoomIn, contentDescription = "Zoom in waveform")
         }
 
         OutlinedButton(
@@ -203,6 +236,31 @@ fun SimulationScreen(
           Icon(Icons.Rounded.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
           Spacer(Modifier.width(4.dp))
           Text("Reset", style = MaterialTheme.typography.labelMedium)
+        }
+      }
+
+      // Signal Visibility Selection Strip
+      if (simulation.traces.size > 1) {
+        Row(
+          modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState()),
+          horizontalArrangement = Arrangement.spacedBy(6.dp),
+          verticalAlignment = Alignment.CenterVertically,
+        ) {
+          Text(
+            text = "Signals:",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+          simulation.traces.forEach { trace ->
+            val visible = selectedSignals.isEmpty() || trace.name in selectedSignals
+            FilterChip(
+              selected = visible,
+              onClick = { onToggleSignal(trace.name) },
+              label = { Text(trace.name, style = MaterialTheme.typography.labelSmall) },
+            )
+          }
         }
       }
 
@@ -259,6 +317,8 @@ fun SimulationScreen(
         radix = radix,
         selectedCycle = safeSelectedCycle,
         onSelectCycle = { selectedCycle = it },
+        zoomScale = zoomScale,
+        visibleSignals = selectedSignals,
       )
 
       // Cycle Probe Inspector & Manual Bit/Value Tweak Card

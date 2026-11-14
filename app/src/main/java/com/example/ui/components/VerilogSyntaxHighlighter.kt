@@ -13,7 +13,9 @@ import androidx.compose.ui.text.input.OffsetMapping
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
+import com.example.data.model.RtlLanguage
 import com.example.domain.synth.VerilogParseResult
+import com.example.ui.theme.LocalEdaColors
 
 data class VerilogSyntaxPalette(
   val moduleKeyword: Color,
@@ -22,29 +24,29 @@ data class VerilogSyntaxPalette(
   val numberLiteral: Color,
   val comment: Color,
   val stringLiteral: Color,
-  val errorLineBackground: Color = Color(0x28FB7185),
-  val errorTokenBackground: Color = Color(0x55FB7185),
-  val errorUnderline: Color = Color(0xFFFB7185),
+  val errorLineBackground: Color = Color(0x28EF4444),
+  val errorTokenBackground: Color = Color(0x55EF4444),
+  val errorUnderline: Color = Color(0xFFEF4444),
+  val searchMatchBackground: Color = Color(0x453B82F6),
 )
 
 @Composable
 fun rememberVerilogSyntaxPalette(): VerilogSyntaxPalette {
   val primary = MaterialTheme.colorScheme.primary
-  val secondary = MaterialTheme.colorScheme.secondary
-  val tertiary = MaterialTheme.colorScheme.tertiary
-  val error = MaterialTheme.colorScheme.error
-  val muted = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f)
-  return remember(primary, secondary, tertiary, error, muted) {
+  val eda = LocalEdaColors.current
+  val muted = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (eda.isDark) 0.68f else 0.86f)
+  return remember(primary, eda, muted) {
     VerilogSyntaxPalette(
       moduleKeyword = primary,
-      signalTypeKeyword = tertiary,
-      controlKeyword = secondary,
-      numberLiteral = secondary.copy(alpha = 0.88f),
+      signalTypeKeyword = eda.cyanHighlight,
+      controlKeyword = eda.warning,
+      numberLiteral = eda.success,
       comment = muted,
-      stringLiteral = tertiary.copy(alpha = 0.85f),
-      errorLineBackground = error.copy(alpha = 0.14f),
-      errorTokenBackground = error.copy(alpha = 0.34f),
-      errorUnderline = error,
+      stringLiteral = if (eda.isDark) eda.cyanHighlight.copy(alpha = 0.88f) else eda.cyanHighlight,
+      errorLineBackground = eda.error.copy(alpha = if (eda.isDark) 0.14f else 0.10f),
+      errorTokenBackground = eda.error.copy(alpha = if (eda.isDark) 0.34f else 0.22f),
+      errorUnderline = eda.error,
+      searchMatchBackground = primary.copy(alpha = if (eda.isDark) 0.28f else 0.18f),
     )
   }
 }
@@ -53,6 +55,8 @@ class VerilogSyntaxVisualTransformation(
   private val palette: VerilogSyntaxPalette,
   private val errorLine: Int? = null,
   private val errorColumn: Int? = null,
+  private val language: RtlLanguage = RtlLanguage.VERILOG,
+  private val searchQuery: String = "",
 ) : VisualTransformation {
   override fun filter(text: AnnotatedString): TransformedText {
     return TransformedText(
@@ -61,6 +65,8 @@ class VerilogSyntaxVisualTransformation(
         palette = palette,
         errorLine = errorLine,
         errorColumn = errorColumn,
+        language = language,
+        searchQuery = searchQuery,
       ),
       offsetMapping = OffsetMapping.Identity,
     )
@@ -99,8 +105,10 @@ object VerilogDiagnosticFormatter {
         "Tip: Terminate port declarations, wire/reg lines, and statements with a semicolon ';'."
       "endmodule" in lower ->
         "Tip: Every 'module' declaration must be closed with a matching 'endmodule'."
+      "entity" in lower || "architecture" in lower ->
+        "Tip: Ensure every VHDL 'entity' has a matching 'architecture <name> of <entity> is ... end architecture;'."
       "expected ')'" in lower || "'('" in lower ->
-        "Tip: Check for a missing closing ')' in the module port list, always @(...), or instance pins."
+        "Tip: Check for a missing closing ')' in the port list, sensitivity list, or instance pins."
       "expected 'end'" in lower ->
         "Tip: Match every 'begin' block with an 'end' keyword."
       "expected 'endcase'" in lower ->
@@ -108,11 +116,11 @@ object VerilogDiagnosticFormatter {
       "no 'module' declaration" in lower ->
         "Tip: Start your RTL code with `module my_design (...);` and end with `endmodule`."
       "empty" in lower ->
-        "Tip: Enter or paste Verilog RTL, or tap a preset tab above."
+        "Tip: Enter or paste RTL source, or load an example project from Projects."
       "unterminated" in lower ->
         "Tip: Close any open string literal \"...\" or block comment /* ... */."
       else ->
-        "Tip: Check Verilog syntax around the highlighted line and column marker."
+        "Tip: Check HDL syntax around the highlighted line and column marker."
     }
   }
 }
@@ -121,19 +129,31 @@ object VerilogSyntaxHighlighter {
   private val moduleKeywords = setOf(
     "module", "endmodule", "begin", "end",
     "function", "endfunction", "task", "endtask",
-    "generate", "endgenerate",
+    "generate", "endgenerate", "package", "endpackage",
+    "interface", "endinterface",
+    // VHDL structural
+    "entity", "architecture", "component", "library", "use", "is", "of", "port", "generic", "map",
   )
 
   private val signalTypeKeywords = setOf(
     "input", "output", "inout",
-    "wire", "reg", "logic", "integer",
-    "signed", "unsigned", "parameter", "localparam", "genvar",
+    "wire", "reg", "logic", "bit", "byte", "int",
+    "signed", "unsigned", "integer", "parameter", "localparam", "genvar",
+    "typedef", "enum", "struct", "modport", "import",
+    // VHDL types & modes
+    "in", "out", "buffer", "signal", "constant", "variable",
+    "std_logic", "std_logic_vector", "downto", "to", "all",
   )
 
   private val controlKeywords = setOf(
     "assign", "always", "always_comb", "always_ff", "always_latch", "initial",
-    "if", "else", "case", "casez", "casex", "default", "endcase",
-    "posedge", "negedge", "or", "for",
+    "if", "else", "elsif", "then", "case", "casez", "casex", "default", "endcase",
+    "posedge", "negedge", "or", "and", "xor", "not", "nand", "nor", "for",
+    // VHDL control
+    "process", "rising_edge", "falling_edge", "when", "others",
+    // SDC commands
+    "create_clock", "set_input_delay", "set_output_delay", "set_clock_uncertainty",
+    "set_false_path", "get_ports", "get_clocks",
   )
 
   fun lineRangeFor(source: String, oneBasedLine: Int): IntRange? {
@@ -160,7 +180,13 @@ object VerilogSyntaxHighlighter {
     palette: VerilogSyntaxPalette,
     errorLine: Int? = null,
     errorColumn: Int? = null,
+    language: RtlLanguage = RtlLanguage.VERILOG,
+    searchQuery: String = "",
   ): AnnotatedString {
+    val isVhdl = language == RtlLanguage.VHDL ||
+      (source.contains("entity ", ignoreCase = true) && source.contains("architecture ", ignoreCase = true))
+    val isSdc = language == RtlLanguage.SDC
+
     return buildAnnotatedString {
       append(source)
       val n = source.length
@@ -169,8 +195,32 @@ object VerilogSyntaxHighlighter {
       while (i < n) {
         val c = source[i]
 
-        // 1. Single-line comment // ...
+        // 1a. Single-line comment // ...
         if (c == '/' && i + 1 < n && source[i + 1] == '/') {
+          val start = i
+          while (i < n && source[i] != '\n') i++
+          addStyle(
+            style = SpanStyle(color = palette.comment, fontStyle = FontStyle.Italic),
+            start = start,
+            end = i,
+          )
+          continue
+        }
+
+        // 1b. VHDL single-line comment -- ...
+        if (isVhdl && c == '-' && i + 1 < n && source[i + 1] == '-') {
+          val start = i
+          while (i < n && source[i] != '\n') i++
+          addStyle(
+            style = SpanStyle(color = palette.comment, fontStyle = FontStyle.Italic),
+            start = start,
+            end = i,
+          )
+          continue
+        }
+
+        // 1c. SDC single-line comment # ...
+        if (isSdc && c == '#') {
           val start = i
           while (i < n && source[i] != '\n') i++
           addStyle(
@@ -212,12 +262,12 @@ object VerilogSyntaxHighlighter {
           continue
         }
 
-        // 4. Sized or unsized Verilog numeric literal (e.g. 8'hFF, 4'b0101, 'd0, 128)
-        if (c.isDigit() || (c == '\'' && i + 1 < n && source[i + 1].lowercaseChar() in setOf('b', 'o', 'd', 'h'))) {
+        // 4. Numeric literal (e.g. 8'hFF, 4'b0101, '1', 128)
+        if (c.isDigit() || (c == '\'' && i + 1 < n && source[i + 1].lowercaseChar() in setOf('b', 'o', 'd', 'h', '0', '1'))) {
           val prevIsIdent = i > 0 && isIdentPart(source[i - 1])
           if (!prevIsIdent) {
             val start = i
-            while (i < n && (source[i].isLetterOrDigit() || source[i] == '\'' || source[i] == '_' || source[i] == '?' || source[i] == 'x' || source[i] == 'X' || source[i] == 'z' || source[i] == 'Z')) {
+            while (i < n && (source[i].isLetterOrDigit() || source[i] == '\'' || source[i] == '_' || source[i] == '?' || source[i] == '.')) {
               i++
             }
             addStyle(
@@ -242,12 +292,13 @@ object VerilogSyntaxHighlighter {
           continue
         }
 
-        // 5. Identifiers & Verilog keywords (matched only at full word boundaries)
+        // 5. Identifiers & HDL keywords (matched at full word boundaries)
         if (isIdentStart(c)) {
           val start = i
           i++
           while (i < n && isIdentPart(source[i])) i++
-          val word = source.substring(start, i)
+          val rawWord = source.substring(start, i)
+          val word = if (isVhdl) rawWord.lowercase() else rawWord
           val keywordColor = when (word) {
             in moduleKeywords -> palette.moduleKeyword
             in signalTypeKeywords -> palette.signalTypeKeyword
@@ -267,7 +318,20 @@ object VerilogSyntaxHighlighter {
         i++
       }
 
-      // 6. Overlay real-time syntax error line & token highlight
+      // 6. Highlight Search Query Matches (if active)
+      if (searchQuery.isNotBlank()) {
+        var idx = source.indexOf(searchQuery, startIndex = 0, ignoreCase = true)
+        while (idx >= 0) {
+          addStyle(
+            style = SpanStyle(background = palette.searchMatchBackground),
+            start = idx,
+            end = (idx + searchQuery.length).coerceAtMost(n),
+          )
+          idx = source.indexOf(searchQuery, startIndex = idx + searchQuery.length.coerceAtLeast(1), ignoreCase = true)
+        }
+      }
+
+      // 7. Overlay real-time syntax error line & token highlight
       if (errorLine != null) {
         val range = lineRangeFor(source, errorLine)
         if (range != null && range.first < range.last) {

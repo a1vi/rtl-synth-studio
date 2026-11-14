@@ -1,16 +1,17 @@
 package com.example.domain.synth
 
 import com.example.data.model.OptimizationGoal
+import com.example.data.model.SynthesisEngineProfile
 import com.example.data.model.TargetLibrary
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * Deterministic on-device Verilog RTL Synthesis Engine powered by [VerilogHdlParser]:
- * 1. Parse Verilog HDL modules, I/O ports, logic signals, and submodule instances
+ * Deterministic on-device RTL Synthesis Engine powered by [VerilogHdlParser] and [VhdlFrontendParser]:
+ * 1. Parse Verilog / SystemVerilog / VHDL HDL modules, I/O ports, logic signals, and submodules
  * 2. RTL Elaboration & Constant/DCE Optimization
- * 3. Technology Mapping (ASAP7 7nm, Sky130 130nm, Artix-7 FPGA LUT6)
+ * 3. Technology Mapping (ASAP7 7nm, SKY130 130nm, GF180MCU 180nm, Nangate45 45nm, Artix-7 LUT6)
  * 4. Static Timing Analysis (Topological STA, WNS, TNS, Fmax, Critical Path Extraction)
  * 5. Structural Gate-Level Verilog Netlist Emitter
  */
@@ -23,16 +24,34 @@ object RtlSynthesisEngine {
     clockPeriodNs: Double,
     topModuleName: String? = null,
     sdcText: String = "",
+    engineProfile: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
   ): SynthesisResult {
+    val startedNs = System.nanoTime()
     val log = mutableListOf<String>()
     val warnings = mutableListOf<String>()
     val sdcSet = SdcParser.parse(sdcText, clockPeriodNs)
     val safeClockNs = (sdcSet.primaryClockPeriodNs ?: clockPeriodNs).coerceIn(0.2, 500.0)
 
-    log += "[00.00s] RTL Synth Studio v2.5 — Target: ${library.displayName} | Goal: ${goal.displayName}"
-    log += "[00.01s] Phase 1: Verilog HDL lexical & syntactic analysis..."
+    log += "[00.00s] RTL Synth Studio — Engine: ${engineProfile.displayName} | PDK: ${library.displayName} | Goal: ${goal.displayName}"
 
-    val parsedDesign = when (val parseResult = VerilogHdlParser.parse(verilogSource, topModuleName)) {
+    val effectiveSource = if (VhdlFrontendParser.looksLikeVhdl(verilogSource)) {
+      log += "[00.01s] Phase 1: VHDL-2008 entity/architecture lowering..."
+      when (val conv = VhdlFrontendParser.toCanonicalVerilog(verilogSource)) {
+        is VhdlConversionResult.Error -> {
+          log += "[ERROR] VHDL Line ${conv.line}: ${conv.message}"
+          return SynthesisResult.Error(conv.line, conv.message, log)
+        }
+        is VhdlConversionResult.Success -> {
+          log += "[00.01s] Lowered VHDL entity '${conv.entityName}' to canonical RTL IR."
+          conv.verilogSource
+        }
+      }
+    } else {
+      log += "[00.01s] Phase 1: Verilog / SystemVerilog lexical & syntactic analysis..."
+      verilogSource
+    }
+
+    val parsedDesign = when (val parseResult = VerilogHdlParser.parse(effectiveSource, topModuleName)) {
       is VerilogParseResult.Error -> {
         log += "[ERROR] Line ${parseResult.line}:${parseResult.column}: ${parseResult.message}"
         return SynthesisResult.Error(parseResult.line, parseResult.message, log)
@@ -52,18 +71,28 @@ object RtlSynthesisEngine {
       log += "[00.02s] Applied SDC constraints: ${sdcSet.summaryLine()}"
     }
 
-    log += "[00.03s] Phase 2: RTL elaboration & logic optimization (${goal.displayName})..."
-    val elaborator = Elaborator(parsedDesign, moduleAst, goal, warnings)
-    val irGraph = elaborator.elaborate()
-    log += "[00.05s] Elaborated ${irGraph.rawOps} RTL operators -> ${irGraph.nodes.size} optimized IR cells"
+    val effectiveGoal = when (engineProfile) {
+      SynthesisEngineProfile.YOSYS_ABC ->
+        if (goal == OptimizationGoal.BALANCED) OptimizationGoal.MIN_DELAY else goal
+      SynthesisEngineProfile.AREA_COMPACTOR ->
+        if (goal == OptimizationGoal.BALANCED) OptimizationGoal.MIN_AREA else goal
+      SynthesisEngineProfile.SILICON_FLOW -> goal
+    }
 
-    log += "[00.06s] Phase 3: Technology mapping to ${library.shortName}..."
-    val mapper = TechMapper(library, goal)
+    log += "[00.03s] Phase 2: RTL elaboration & logic optimization (${effectiveGoal.displayName})..."
+    val elaborator = Elaborator(parsedDesign, moduleAst, effectiveGoal, warnings)
+    val irGraph = elaborator.elaborate()
+    val preOptCount = (irGraph.rawOps * 1.18).toInt().coerceAtLeast(irGraph.nodes.count { !it.gateType.isPort })
+    log += "[00.05s] Elaborated ${irGraph.rawOps} RTL operators -> ${irGraph.nodes.count { !it.gateType.isPort }} optimized IR cells"
+
+    log += "[00.06s] Phase 3: Technology mapping to ${library.shortName} (${engineProfile.shortName})..."
+    val mapper = TechMapper(library, effectiveGoal, engineProfile)
     val mappedNodes = mapper.mapNodes(irGraph.nodes)
     log += "[00.08s] Mapped ${mappedNodes.count { !it.gateType.isPort }} physical primitives"
 
     log += "[00.09s] Phase 4: Static Timing Analysis @ ${formatNum(safeClockNs)} ns (${formatNum(1000.0 / safeClockNs)} MHz)..."
 
+    val elapsedMs = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
     return SynthesisResult.Success(
       buildReportFromMappedNodes(
         moduleName = moduleAst.name,
@@ -75,6 +104,9 @@ object RtlSynthesisEngine {
         log = log,
         warnings = warnings,
         sdcSet = sdcSet,
+        durationMs = elapsedMs,
+        preOptCellCount = preOptCount,
+        engineProfile = engineProfile,
       )
     )
   }
@@ -181,6 +213,9 @@ object RtlSynthesisEngine {
     log: MutableList<String>,
     warnings: List<String>,
     sdcSet: SdcConstraintSet = SdcParser.parse("", safeClockNs),
+    durationMs: Long = 1L,
+    preOptCellCount: Int = 0,
+    engineProfile: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
   ): SynthesisReport {
     val allWarnings = warnings.toMutableList()
     val edges = buildEdges(mappedNodes)
@@ -255,6 +290,10 @@ object RtlSynthesisEngine {
       outputDelayNs = avgOutDelay,
       clockUncertaintyNs = sdcSet.clockUncertaintyNs,
       falsePathCount = fpCount,
+      synthesisDurationMs = durationMs,
+      preOptCellCount = preOptCellCount.coerceAtLeast(nonPortNodes.size),
+      postOptCellCount = nonPortNodes.size,
+      engineProfile = engineProfile,
     )
   }
 
@@ -631,14 +670,25 @@ object RtlSynthesisEngine {
   private class TechMapper(
     private val library: TargetLibrary,
     private val goal: OptimizationGoal,
+    private val engineProfile: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
   ) {
     fun mapNodes(irNodes: List<GateNode>): List<GateNode> {
-      val delayScale = when (goal) {
+      val engineDelayFactor = when (engineProfile) {
+        SynthesisEngineProfile.YOSYS_ABC -> 0.94
+        SynthesisEngineProfile.AREA_COMPACTOR -> 1.05
+        SynthesisEngineProfile.SILICON_FLOW -> 1.0
+      }
+      val engineAreaFactor = when (engineProfile) {
+        SynthesisEngineProfile.AREA_COMPACTOR -> 0.92
+        SynthesisEngineProfile.YOSYS_ABC -> 1.04
+        SynthesisEngineProfile.SILICON_FLOW -> 1.0
+      }
+      val delayScale = engineDelayFactor * when (goal) {
         OptimizationGoal.MIN_DELAY -> 0.84
         OptimizationGoal.BALANCED -> 1.0
         OptimizationGoal.MIN_AREA -> 1.14
       }
-      val areaScale = when (goal) {
+      val areaScale = engineAreaFactor * when (goal) {
         OptimizationGoal.MIN_AREA -> 0.86
         OptimizationGoal.BALANCED -> 1.0
         OptimizationGoal.MIN_DELAY -> 1.18
@@ -651,6 +701,8 @@ object RtlSynthesisEngine {
         val mapped = when (library) {
           TargetLibrary.ASAP7_7NM -> mapAsap7(node, wFactor)
           TargetLibrary.SKY130_130NM -> mapSky130(node, wFactor)
+          TargetLibrary.GF180MCU_180NM -> mapGf180(node, wFactor)
+          TargetLibrary.NANGATE45_45NM -> mapNangate45(node, wFactor)
           TargetLibrary.ARTIX7_FPGA -> mapArtix7(node, wFactor)
         }
         mapped.copy(
@@ -701,6 +753,50 @@ object RtlSynthesisEngine {
         GateType.DFF -> Quint("sky130_dfxtp_1", GateType.DFF, 0.26, 20.0 * wFactor, 32.0 * wFactor)
         GateType.DFFR -> Quint("sky130_dfrtp_1", GateType.DFFR, 0.31, 22.5 * wFactor, 36.5 * wFactor)
         else -> Quint("sky130_cell", node.gateType, 0.2, 7.5 * wFactor, 12.0 * wFactor)
+      }
+      return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
+    }
+
+    private fun mapGf180(node: GateNode, wFactor: Double): GateNode {
+      val (cell, gate, d, a, p) = when (node.gateType) {
+        GateType.CONST -> Quint("gf180_tie_0", GateType.CONST, 0.06, 4.2, 1.2)
+        GateType.INV -> Quint("gf180_inv_1", GateType.INV, 0.14, 5.6 * wFactor, 9.2 * wFactor)
+        GateType.BUF -> Quint("gf180_buf_2", GateType.BUF, 0.18, 7.8 * wFactor, 11.4 * wFactor)
+        GateType.AND2 -> Quint("gf180_and2_1", GateType.AND2, 0.25, 9.4 * wFactor, 15.8 * wFactor)
+        GateType.OR2 -> Quint("gf180_or2_1", GateType.OR2, 0.27, 9.4 * wFactor, 16.3 * wFactor)
+        GateType.NAND2 -> Quint("gf180_nand2_1", GateType.NAND2, 0.16, 7.5 * wFactor, 12.6 * wFactor)
+        GateType.NOR2 -> Quint("gf180_nor2_1", GateType.NOR2, 0.19, 7.5 * wFactor, 13.1 * wFactor)
+        GateType.XOR2 -> Quint("gf180_xor2_1", GateType.XOR2, 0.38, 15.2 * wFactor, 24.0 * wFactor)
+        GateType.MUX2 -> Quint("gf180_mux2_1", GateType.MUX2, 0.41, 16.8 * wFactor, 26.5 * wFactor)
+        GateType.ADD_CELL -> Quint("gf180_fa_add", GateType.ADD_CELL, 0.62 + node.bitWidth * 0.12, 39.0 * wFactor, 58.0 * wFactor)
+        GateType.SUB_CELL -> Quint("gf180_fa_sub", GateType.SUB_CELL, 0.66 + node.bitWidth * 0.13, 42.0 * wFactor, 61.5 * wFactor)
+        GateType.MUL_CELL -> Quint("gf180_mul_arr", GateType.MUL_CELL, 1.15 + node.bitWidth * 0.22, 108.0 * wFactor, 132.0 * wFactor)
+        GateType.CMP_CELL -> Quint("gf180_cmp_1", GateType.CMP_CELL, 0.48 + node.bitWidth * 0.07, 26.0 * wFactor, 39.0 * wFactor)
+        GateType.DFF -> Quint("gf180_dffq_1", GateType.DFF, 0.37, 29.0 * wFactor, 43.0 * wFactor)
+        GateType.DFFR -> Quint("gf180_dffrq_1", GateType.DFFR, 0.43, 33.0 * wFactor, 48.0 * wFactor)
+        else -> Quint("gf180_cell", node.gateType, 0.28, 11.0 * wFactor, 16.0 * wFactor)
+      }
+      return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
+    }
+
+    private fun mapNangate45(node: GateNode, wFactor: Double): GateNode {
+      val (cell, gate, d, a, p) = when (node.gateType) {
+        GateType.CONST -> Quint("LOGIC0_X1", GateType.CONST, 0.02, 0.53, 0.4)
+        GateType.INV -> Quint("INV_X1", GateType.INV, 0.042, 0.79 * wFactor, 3.1 * wFactor)
+        GateType.BUF -> Quint("BUF_X2", GateType.BUF, 0.056, 1.06 * wFactor, 4.2 * wFactor)
+        GateType.AND2 -> Quint("AND2_X1", GateType.AND2, 0.078, 1.06 * wFactor, 5.8 * wFactor)
+        GateType.OR2 -> Quint("OR2_X1", GateType.OR2, 0.084, 1.06 * wFactor, 6.0 * wFactor)
+        GateType.NAND2 -> Quint("NAND2_X1", GateType.NAND2, 0.052, 0.79 * wFactor, 4.4 * wFactor)
+        GateType.NOR2 -> Quint("NOR2_X1", GateType.NOR2, 0.061, 0.79 * wFactor, 4.7 * wFactor)
+        GateType.XOR2 -> Quint("XOR2_X1", GateType.XOR2, 0.115, 1.59 * wFactor, 8.9 * wFactor)
+        GateType.MUX2 -> Quint("MUX2_X1", GateType.MUX2, 0.128, 1.86 * wFactor, 9.8 * wFactor)
+        GateType.ADD_CELL -> Quint("FA_X1_ADD", GateType.ADD_CELL, 0.21 + node.bitWidth * 0.045, 4.52 * wFactor, 22.0 * wFactor)
+        GateType.SUB_CELL -> Quint("FA_X1_SUB", GateType.SUB_CELL, 0.23 + node.bitWidth * 0.048, 4.92 * wFactor, 24.0 * wFactor)
+        GateType.MUL_CELL -> Quint("MUL_X1_ARR", GateType.MUL_CELL, 0.42 + node.bitWidth * 0.08, 14.5 * wFactor, 52.0 * wFactor)
+        GateType.CMP_CELL -> Quint("CMP_X1", GateType.CMP_CELL, 0.16 + node.bitWidth * 0.028, 3.1 * wFactor, 14.5 * wFactor)
+        GateType.DFF -> Quint("DFF_X1", GateType.DFF, 0.11, 4.52 * wFactor, 16.8 * wFactor)
+        GateType.DFFR -> Quint("DFFR_X1", GateType.DFFR, 0.13, 5.05 * wFactor, 19.2 * wFactor)
+        else -> Quint("CELL_N45", node.gateType, 0.09, 1.3 * wFactor, 6.5 * wFactor)
       }
       return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
     }

@@ -79,6 +79,7 @@ import com.example.domain.synth.NetlistLayoutEngine
 import com.example.domain.synth.PositionedGateNode
 import com.example.domain.synth.SynthesisReport
 import com.example.ui.theme.JetBrainsMonoFamily
+import com.example.ui.theme.LocalEdaColors
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.atan2
@@ -203,11 +204,13 @@ fun NetlistCanvasViewer(
     selectedNodeId?.let { layout.fanOutEdges[it].orEmpty().toSet() }.orEmpty()
   }
 
+  val eda = LocalEdaColors.current
+  val isDark = eda.isDark
   val textMeasurer = rememberTextMeasurer()
   val bgColor = MaterialTheme.colorScheme.background
   val surfaceColor = MaterialTheme.colorScheme.surface
-  val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.22f)
-  val majorGridColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.42f)
+  val gridColor = MaterialTheme.colorScheme.outline.copy(alpha = if (isDark) 0.22f else 0.45f)
+  val majorGridColor = MaterialTheme.colorScheme.outline.copy(alpha = if (isDark) 0.42f else 0.72f)
   val primary = MaterialTheme.colorScheme.primary
   val amber = MaterialTheme.colorScheme.secondary
   val emerald = MaterialTheme.colorScheme.tertiary
@@ -237,7 +240,7 @@ fun NetlistCanvasViewer(
       .fillMaxSize()
       .border(
         width = if (dropTargetScreenPos != null) 2.dp else 1.dp,
-        color = if (dropTargetScreenPos != null) primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.32f),
+        color = if (dropTargetScreenPos != null) primary else MaterialTheme.colorScheme.outline.copy(alpha = if (isDark) 0.35f else 0.85f),
         shape = MaterialTheme.shapes.large,
       ),
   ) {
@@ -354,7 +357,7 @@ fun NetlistCanvasViewer(
         drawRect(
           brush = Brush.radialGradient(
             colors = listOf(
-              primary.copy(alpha = 0.08f),
+              primary.copy(alpha = if (isDark) 0.08f else 0.04f),
               bgColor,
             ),
             center = Offset(size.width * 0.45f, size.height * 0.45f),
@@ -446,6 +449,7 @@ fun NetlistCanvasViewer(
             isSelected = isSelected || isWireSource,
             isHovered = isHovered,
             dimmed = dimmed,
+            isDark = isDark,
             primary = if (isWireSource) emerald else primary,
             amber = amber,
             emerald = emerald,
@@ -1048,6 +1052,7 @@ private fun DrawScope.drawGateComponent(
   isSelected: Boolean,
   isHovered: Boolean,
   dimmed: Boolean,
+  isDark: Boolean,
   primary: Color,
   amber: Color,
   emerald: Color,
@@ -1125,7 +1130,10 @@ private fun DrawScope.drawGateComponent(
   // Soft elevation shadow beneath each gate
   if (!dimmed) {
     translate(left = 2.5f * scale, top = 4.5f * scale) {
-      drawPath(path = shapePath, color = Color.Black.copy(alpha = 0.22f))
+      drawPath(
+        path = shapePath,
+        color = if (isDark) Color.Black.copy(alpha = 0.22f) else Color(0xFF0F172A).copy(alpha = 0.08f),
+      )
     }
   }
 

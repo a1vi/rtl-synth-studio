@@ -1,6 +1,6 @@
 {
   "name": "RTL Synth Studio",
-  "description": "RTL synthesis workbench with Verilog HDL parsing, technology mapping, static timing analysis, gate-level netlist schematic visualization, and cloud design sync.",
+  "description": "Mobile RTL synthesis workbench with Verilog HDL parsing, technology mapping, static timing analysis, waveform simulation, and gate-level netlist schematic visualization.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -6,61 +6,132 @@ import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+
+@Immutable
+data class EdaSemanticColors(
+  val isDark: Boolean,
+  val codeSurface: Color,
+  val elevatedCard: Color,
+  val subtleBorder: Color,
+  val cyanHighlight: Color,
+  val cyanContainer: Color,
+  val success: Color,
+  val successContainer: Color,
+  val warning: Color,
+  val warningContainer: Color,
+  val error: Color,
+  val errorContainer: Color,
+)
+
+private val DarkEdaSemantics = EdaSemanticColors(
+  isDark = true,
+  codeSurface = IndustrialCodeBgDark,
+  elevatedCard = IndustrialCardDark,
+  subtleBorder = IndustrialOutlineDark,
+  cyanHighlight = CyanHighlightDark,
+  cyanContainer = CyanContainerDark,
+  success = EmeraldSuccessDark,
+  successContainer = EmeraldContainerDark,
+  warning = AmberWarningDark,
+  warningContainer = AmberContainerDark,
+  error = RedErrorDark,
+  errorContainer = RedContainerDark,
+)
+
+private val LightEdaSemantics = EdaSemanticColors(
+  isDark = false,
+  codeSurface = IndustrialCodeBgLight,
+  elevatedCard = IndustrialCardLight,
+  subtleBorder = IndustrialOutlineLight,
+  cyanHighlight = CyanHighlightLight,
+  cyanContainer = CyanContainerLight,
+  success = EmeraldSuccessLight,
+  successContainer = EmeraldContainerLight,
+  warning = AmberWarningLight,
+  warningContainer = AmberContainerLight,
+  error = RedErrorLight,
+  errorContainer = RedContainerLight,
+)
+
+val LocalEdaColors = staticCompositionLocalOf { DarkEdaSemantics }
 
 private val DarkColorScheme =
   darkColorScheme(
-    primary = CyanPrimaryDark,
-    onPrimary = CyanOnPrimaryDark,
-    primaryContainer = CyanContainerDark,
-    onPrimaryContainer = CyanOnContainerDark,
-    secondary = AmberSecondaryDark,
-    onSecondary = AmberOnSecondaryDark,
-    secondaryContainer = AmberContainerDark,
-    onSecondaryContainer = AmberOnContainerDark,
-    tertiary = EmeraldPassDark,
-    onTertiary = CyanOnPrimaryDark,
+    primary = ElectricBlueDark,
+    onPrimary = ElectricBlueOnDark,
+    primaryContainer = ElectricBlueContainerDark,
+    onPrimaryContainer = ElectricBlueOnContainerDark,
+    secondary = CyanHighlightDark,
+    onSecondary = CyanOnDark,
+    secondaryContainer = CyanContainerDark,
+    onSecondaryContainer = CyanOnContainerDark,
+    tertiary = EmeraldSuccessDark,
+    onTertiary = ElectricBlueOnDark,
     tertiaryContainer = EmeraldContainerDark,
-    onTertiaryContainer = EmeraldPassDark,
-    background = SiliconBgDark,
+    onTertiaryContainer = EmeraldSuccessDark,
+    background = IndustrialBgDark,
     onBackground = TextPrimaryDark,
-    surface = SiliconSurfaceDark,
+    surface = IndustrialSurfaceDark,
     onSurface = TextPrimaryDark,
-    surfaceVariant = SiliconSurfaceElevatedDark,
+    surfaceVariant = IndustrialCardDark,
     onSurfaceVariant = TextSecondaryDark,
-    outline = SiliconOutlineDark,
-    error = ErrorCoralDark,
-    errorContainer = ErrorContainerDark,
+    surfaceContainerLowest = IndustrialCodeBgDark,
+    surfaceContainerLow = IndustrialBgDark,
+    surfaceContainer = IndustrialSurfaceDark,
+    surfaceContainerHigh = IndustrialCardDark,
+    surfaceContainerHighest = Color(0xFF1E293B),
+    outline = IndustrialOutlineDark,
+    outlineVariant = IndustrialOutlineDark.copy(alpha = 0.65f),
+    error = RedErrorDark,
+    onError = ElectricBlueOnDark,
+    errorContainer = RedContainerDark,
+    onErrorContainer = RedOnContainerDark,
   )
 
 private val LightColorScheme =
   lightColorScheme(
-    primary = CyanPrimaryLight,
-    onPrimary = CyanOnPrimaryLight,
-    primaryContainer = CyanContainerLight,
-    onPrimaryContainer = CyanOnContainerLight,
-    secondary = AmberSecondaryLight,
-    onSecondary = AmberOnSecondaryLight,
-    secondaryContainer = AmberContainerLight,
-    onSecondaryContainer = AmberOnContainerLight,
-    tertiary = EmeraldPassLight,
-    onTertiary = CyanOnPrimaryLight,
-    background = BlueprintBgLight,
+    primary = ElectricBlueLight,
+    onPrimary = ElectricBlueOnLight,
+    primaryContainer = ElectricBlueContainerLight,
+    onPrimaryContainer = ElectricBlueOnContainerLight,
+    secondary = CyanHighlightLight,
+    onSecondary = CyanOnLight,
+    secondaryContainer = CyanContainerLight,
+    onSecondaryContainer = CyanOnContainerLight,
+    tertiary = EmeraldSuccessLight,
+    onTertiary = ElectricBlueOnLight,
+    tertiaryContainer = EmeraldContainerLight,
+    onTertiaryContainer = EmeraldOnContainerLight,
+    background = IndustrialBgLight,
     onBackground = TextPrimaryLight,
-    surface = BlueprintSurfaceLight,
+    surface = IndustrialSurfaceLight,
     onSurface = TextPrimaryLight,
-    surfaceVariant = BlueprintSurfaceElevatedLight,
+    surfaceVariant = IndustrialCardLight,
     onSurfaceVariant = TextSecondaryLight,
-    outline = BlueprintOutlineLight,
-    error = ErrorCoralLight,
+    surfaceContainerLowest = IndustrialSurfaceLight,
+    surfaceContainerLow = IndustrialCardLight,
+    surfaceContainer = IndustrialBgLight,
+    surfaceContainerHigh = IndustrialSurfaceHighLight,
+    surfaceContainerHighest = Color(0xFFDCE4EF),
+    outline = IndustrialOutlineLight,
+    outlineVariant = IndustrialOutlineLight.copy(alpha = 0.85f),
+    error = RedErrorLight,
+    onError = ElectricBlueOnLight,
+    errorContainer = RedContainerLight,
+    onErrorContainer = RedOnContainerLight,
   )
 
-val SiliconShapes = Shapes(
+val IndustrialShapes = Shapes(
   extraSmall = RoundedCornerShape(6.dp),
-  small = RoundedCornerShape(10.dp),
-  medium = RoundedCornerShape(14.dp),
-  large = RoundedCornerShape(18.dp),
-  extraLarge = RoundedCornerShape(24.dp),
+  small = RoundedCornerShape(8.dp),
+  medium = RoundedCornerShape(12.dp),
+  large = RoundedCornerShape(14.dp),
+  extraLarge = RoundedCornerShape(18.dp),
 )
 
 @Composable
@@ -69,11 +140,14 @@ fun RtlSynthTheme(
   content: @Composable () -> Unit,
 ) {
   val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
+  val semanticColors = if (darkTheme) DarkEdaSemantics else LightEdaSemantics
 
-  MaterialTheme(
-    colorScheme = colorScheme,
-    typography = Typography,
-    shapes = SiliconShapes,
-    content = content,
-  )
+  CompositionLocalProvider(LocalEdaColors provides semanticColors) {
+    MaterialTheme(
+      colorScheme = colorScheme,
+      typography = Typography,
+      shapes = IndustrialShapes,
+      content = content,
+    )
+  }
 }

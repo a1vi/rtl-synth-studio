@@ -1,11 +1,15 @@
 package com.example.data.local
 
 import android.content.Context
+import com.example.data.model.AppSettings
+import com.example.data.model.ExportFormat
 import com.example.data.model.OptimizationGoal
 import com.example.data.model.RtlDesign
+import com.example.data.model.RtlFileEntry
+import com.example.data.model.RtlLanguage
+import com.example.data.model.SynthesisEngineProfile
 import com.example.data.model.SynthesisRun
 import com.example.data.model.TargetLibrary
-import com.google.firebase.Timestamp
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -15,6 +19,7 @@ import java.io.File
 import java.util.UUID
 
 data class LocalDraftSnapshot(
+  val activeDesignId: String? = null,
   val designName: String,
   val description: String,
   val verilogCode: String,
@@ -23,12 +28,13 @@ data class LocalDraftSnapshot(
   val optimizationGoal: OptimizationGoal,
   val clockPeriodNs: Double,
   val savedAtEpochMs: Long = System.currentTimeMillis(),
+  val files: List<RtlFileEntry> = emptyList(),
+  val activeFileId: String? = null,
 )
 
 /**
- * Offline-first local persistence store using JSON files in app-private storage (`filesDir`).
- * Enables full RTL authoring, synthesis, simulation, and PPA run tracking without network or sign-in,
- * and allows syncing locally saved modules to Firestore once signed in with Google.
+ * On-device persistence store using JSON files in app-private storage (`filesDir`).
+ * Preserves active drafts, multi-file RTL projects, historical PPA runs, and IDE settings locally.
  */
 class LocalWorkspaceStore(private val rootDir: File) {
 
@@ -37,6 +43,7 @@ class LocalWorkspaceStore(private val rootDir: File) {
   private val designsFile: File get() = File(rootDir, "local_designs.json")
   private val runsFile: File get() = File(rootDir, "local_runs.json")
   private val draftFile: File get() = File(rootDir, "active_draft.json")
+  private val settingsFile: File get() = File(rootDir, "app_settings.json")
 
   private val _localDesigns = MutableStateFlow<List<RtlDesign>>(emptyList())
   val localDesigns: StateFlow<List<RtlDesign>> = _localDesigns.asStateFlow()
@@ -50,10 +57,61 @@ class LocalWorkspaceStore(private val rootDir: File) {
     _localRuns.value = readRunsFromDisk()
   }
 
+  fun saveSettings(settings: AppSettings) {
+    runCatching {
+      rootDir.mkdirs()
+      val obj = JSONObject().apply {
+        put("darkTheme", settings.darkTheme)
+        put("compactDensity", settings.compactDensity)
+        put("editorFontSizeSp", settings.editorFontSizeSp)
+        put("tabWidth", settings.tabWidth)
+        put("autoIndent", settings.autoIndent)
+        put("showLineNumbers", settings.showLineNumbers)
+        put("wordWrap", settings.wordWrap)
+        put("autoSaveIntervalSec", settings.autoSaveIntervalSec)
+        put("defaultEngine", settings.defaultEngine.id)
+        put("aggressiveOptimization", settings.aggressiveOptimization)
+        put("retainHierarchy", settings.retainHierarchy)
+        put("defaultLibrary", settings.defaultLibrary.id)
+        put("localBridgeEnabled", settings.localBridgeEnabled)
+        put("localBridgeEndpoint", settings.localBridgeEndpoint)
+        put("defaultExportFormat", settings.defaultExportFormat.id)
+        put("includeTimestampsInExport", settings.includeTimestampsInExport)
+      }
+      settingsFile.writeText(obj.toString())
+    }
+  }
+
+  fun loadSettings(): AppSettings {
+    return runCatching {
+      if (!settingsFile.exists()) return AppSettings()
+      val obj = JSONObject(settingsFile.readText())
+      AppSettings(
+        darkTheme = obj.optBoolean("darkTheme", true),
+        compactDensity = obj.optBoolean("compactDensity", false),
+        editorFontSizeSp = obj.optInt("editorFontSizeSp", 13).coerceIn(11, 18),
+        tabWidth = obj.optInt("tabWidth", 2).coerceIn(2, 4),
+        autoIndent = obj.optBoolean("autoIndent", true),
+        showLineNumbers = obj.optBoolean("showLineNumbers", true),
+        wordWrap = obj.optBoolean("wordWrap", false),
+        autoSaveIntervalSec = obj.optInt("autoSaveIntervalSec", 15).coerceIn(0, 60),
+        defaultEngine = SynthesisEngineProfile.fromId(obj.optString("defaultEngine", SynthesisEngineProfile.SILICON_FLOW.id)),
+        aggressiveOptimization = obj.optBoolean("aggressiveOptimization", false),
+        retainHierarchy = obj.optBoolean("retainHierarchy", true),
+        defaultLibrary = TargetLibrary.fromId(obj.optString("defaultLibrary", TargetLibrary.ASAP7_7NM.id)),
+        localBridgeEnabled = obj.optBoolean("localBridgeEnabled", false),
+        localBridgeEndpoint = obj.optString("localBridgeEndpoint", "http://127.0.0.1:8765"),
+        defaultExportFormat = ExportFormat.fromId(obj.optString("defaultExportFormat", ExportFormat.VERILOG_NETLIST.id)),
+        includeTimestampsInExport = obj.optBoolean("includeTimestampsInExport", true),
+      )
+    }.getOrDefault(AppSettings())
+  }
+
   fun saveActiveDraft(draft: LocalDraftSnapshot) {
     runCatching {
       rootDir.mkdirs()
       val obj = JSONObject().apply {
+        put("activeDesignId", draft.activeDesignId.orEmpty())
         put("designName", draft.designName)
         put("description", draft.description)
         put("verilogCode", draft.verilogCode)
@@ -62,6 +120,8 @@ class LocalWorkspaceStore(private val rootDir: File) {
         put("optimizationGoal", draft.optimizationGoal.id)
         put("clockPeriodNs", draft.clockPeriodNs)
         put("savedAtEpochMs", draft.savedAtEpochMs)
+        put("activeFileId", draft.activeFileId.orEmpty())
+        put("files", serializeFiles(draft.files))
       }
       draftFile.writeText(obj.toString())
     }
@@ -74,6 +134,7 @@ class LocalWorkspaceStore(private val rootDir: File) {
       val code = obj.optString("verilogCode", "")
       if (code.isBlank()) return null
       LocalDraftSnapshot(
+        activeDesignId = obj.optString("activeDesignId", "").ifBlank { null },
         designName = obj.optString("designName", "rtl_module"),
         description = obj.optString("description", ""),
         verilogCode = code,
@@ -82,18 +143,22 @@ class LocalWorkspaceStore(private val rootDir: File) {
         optimizationGoal = OptimizationGoal.fromId(obj.optString("optimizationGoal", OptimizationGoal.BALANCED.id)),
         clockPeriodNs = obj.optDouble("clockPeriodNs", 2.0),
         savedAtEpochMs = obj.optLong("savedAtEpochMs", 0L),
+        files = deserializeFiles(obj.optJSONArray("files")),
+        activeFileId = obj.optString("activeFileId", "").ifBlank { null },
       )
     }.getOrNull()
   }
 
   fun upsertLocalDesign(design: RtlDesign): String {
     val id = design.id.ifBlank { "local_${UUID.randomUUID().toString().take(8)}" }
-    val nowSec = System.currentTimeMillis() / 1000L
+    val nowMs = System.currentTimeMillis()
+    val existing = _localDesigns.value.firstOrNull { it.id == id }
     val normalized = design.copy(
       id = id,
-      userId = "local_offline",
-      createdAt = design.createdAt ?: Timestamp(nowSec, 0),
-      updatedAt = Timestamp(nowSec, 0),
+      createdAtMillis = existing?.createdAtMillis?.takeIf { it > 0L }
+        ?: design.createdAtMillis.takeIf { it > 0L }
+        ?: nowMs,
+      updatedAtMillis = nowMs,
     )
     val current = _localDesigns.value.filterNot { it.id == id }.toMutableList()
     current.add(0, normalized)
@@ -110,11 +175,10 @@ class LocalWorkspaceStore(private val rootDir: File) {
 
   fun recordLocalRun(run: SynthesisRun): String {
     val id = run.id.ifBlank { "run_${UUID.randomUUID().toString().take(8)}" }
-    val nowSec = System.currentTimeMillis() / 1000L
+    val nowMs = System.currentTimeMillis()
     val normalized = run.copy(
       id = id,
-      userId = "local_offline",
-      createdAt = run.createdAt ?: Timestamp(nowSec, 0),
+      createdAtMillis = run.createdAtMillis.takeIf { it > 0L } ?: nowMs,
     )
     val updated = (listOf(normalized) + _localRuns.value.filterNot { it.id == id }).take(60)
     _localRuns.value = updated
@@ -128,6 +192,56 @@ class LocalWorkspaceStore(private val rootDir: File) {
     writeRunsToDisk(updated)
   }
 
+  fun clearSynthesisRuns() {
+    _localRuns.value = emptyList()
+    runCatching { if (runsFile.exists()) runsFile.delete() }
+  }
+
+  fun clearActiveDraft() {
+    runCatching { if (draftFile.exists()) draftFile.delete() }
+  }
+
+  fun estimatedStorageBytes(): Long {
+    val files = listOf(designsFile, runsFile, draftFile, settingsFile)
+    return files.sumOf { if (it.exists()) it.length() else 0L }
+  }
+
+  private fun serializeFiles(files: List<RtlFileEntry>): JSONArray {
+    val arr = JSONArray()
+    files.forEach { f ->
+      arr.put(
+        JSONObject().apply {
+          put("id", f.id)
+          put("name", f.name)
+          put("language", f.language.name)
+          put("content", f.content)
+        }
+      )
+    }
+    return arr
+  }
+
+  private fun deserializeFiles(arr: JSONArray?): List<RtlFileEntry> {
+    if (arr == null) return emptyList()
+    return buildList {
+      for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        val id = obj.optString("id")
+        val name = obj.optString("name")
+        if (id.isNotBlank() && name.isNotBlank()) {
+          add(
+            RtlFileEntry(
+              id = id,
+              name = name,
+              language = RtlLanguage.fromId(obj.optString("language", RtlLanguage.VERILOG.name)),
+              content = obj.optString("content", ""),
+            )
+          )
+        }
+      }
+    }
+  }
+
   private fun readDesignsFromDisk(): List<RtlDesign> {
     return runCatching {
       if (!designsFile.exists()) return emptyList()
@@ -135,12 +249,12 @@ class LocalWorkspaceStore(private val rootDir: File) {
       buildList {
         for (i in 0 until arr.length()) {
           val obj = arr.getJSONObject(i)
-          val createdSec = obj.optLong("createdAtSec", 0L)
-          val updatedSec = obj.optLong("updatedAtSec", createdSec)
+          val createdMs = obj.optLong("createdAtMillis", obj.optLong("createdAtSec", 0L) * 1000L)
+          val updatedMs = obj.optLong("updatedAtMillis", obj.optLong("updatedAtSec", 0L) * 1000L)
+            .let { if (it > 0L) it else createdMs }
           add(
             RtlDesign(
               id = obj.optString("id"),
-              userId = "local_offline",
               name = obj.optString("name"),
               description = obj.optString("description"),
               verilogCode = obj.optString("verilogCode"),
@@ -151,8 +265,10 @@ class LocalWorkspaceStore(private val rootDir: File) {
               lastAreaUm2 = obj.optDouble("lastAreaUm2", 0.0),
               lastCellCount = obj.optLong("lastCellCount", 0L),
               lastPowerMw = obj.optDouble("lastPowerMw", 0.0),
-              createdAt = if (createdSec > 0) Timestamp(createdSec, 0) else null,
-              updatedAt = if (updatedSec > 0) Timestamp(updatedSec, 0) else null,
+              createdAtMillis = createdMs,
+              updatedAtMillis = updatedMs,
+              language = obj.optString("language", RtlLanguage.VERILOG.name),
+              files = deserializeFiles(obj.optJSONArray("files")),
             )
           )
         }
@@ -178,8 +294,10 @@ class LocalWorkspaceStore(private val rootDir: File) {
             put("lastAreaUm2", d.lastAreaUm2)
             put("lastCellCount", d.lastCellCount)
             put("lastPowerMw", d.lastPowerMw)
-            put("createdAtSec", d.createdAt?.seconds ?: 0L)
-            put("updatedAtSec", d.updatedAt?.seconds ?: 0L)
+            put("createdAtMillis", d.createdAtMillis)
+            put("updatedAtMillis", d.updatedAtMillis)
+            put("language", d.language)
+            put("files", serializeFiles(d.files))
           }
         )
       }
@@ -194,11 +312,10 @@ class LocalWorkspaceStore(private val rootDir: File) {
       buildList {
         for (i in 0 until arr.length()) {
           val obj = arr.getJSONObject(i)
-          val createdSec = obj.optLong("createdAtSec", 0L)
+          val createdMs = obj.optLong("createdAtMillis", obj.optLong("createdAtSec", 0L) * 1000L)
           add(
             SynthesisRun(
               id = obj.optString("id"),
-              userId = "local_offline",
               designId = obj.optString("designId"),
               designName = obj.optString("designName"),
               targetLibrary = obj.optString("targetLibrary", TargetLibrary.ASAP7_7NM.id),
@@ -214,7 +331,9 @@ class LocalWorkspaceStore(private val rootDir: File) {
               powerMw = obj.optDouble("powerMw", 0.0),
               criticalPathSummary = obj.optString("criticalPathSummary"),
               netlistVerilog = obj.optString("netlistVerilog"),
-              createdAt = if (createdSec > 0) Timestamp(createdSec, 0) else null,
+              createdAtMillis = createdMs,
+              durationMs = obj.optLong("durationMs", 0L),
+              engineId = obj.optString("engineId", SynthesisEngineProfile.SILICON_FLOW.id),
             )
           )
         }
@@ -245,7 +364,9 @@ class LocalWorkspaceStore(private val rootDir: File) {
             put("powerMw", r.powerMw)
             put("criticalPathSummary", r.criticalPathSummary)
             put("netlistVerilog", r.netlistVerilog)
-            put("createdAtSec", r.createdAt?.seconds ?: 0L)
+            put("createdAtMillis", r.createdAtMillis)
+            put("durationMs", r.durationMs)
+            put("engineId", r.engineId)
           }
         )
       }

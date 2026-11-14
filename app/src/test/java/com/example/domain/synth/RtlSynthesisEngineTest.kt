@@ -28,16 +28,25 @@ class RtlSynthesisEngineTest {
 
   @Test
   fun synthesizeAlu_sky130_vs_asap7_scalesDelayAndArea() {
-    val preset = PresetRtlDesigns.templates.first { it.name == "alu_8bit" }
+    val preset = PresetRtlDesigns.templates.first { it.name == "alu_8bit_sv" }
     val asap7 = (RtlSynthesisEngine.synthesize(
       preset.verilogCode, TargetLibrary.ASAP7_7NM, OptimizationGoal.MIN_DELAY, 2.0
     ) as SynthesisResult.Success).report
     val sky130 = (RtlSynthesisEngine.synthesize(
       preset.verilogCode, TargetLibrary.SKY130_130NM, OptimizationGoal.MIN_DELAY, 2.0
     ) as SynthesisResult.Success).report
+    val gf180 = (RtlSynthesisEngine.synthesize(
+      preset.verilogCode, TargetLibrary.GF180MCU_180NM, OptimizationGoal.MIN_DELAY, 2.0
+    ) as SynthesisResult.Success).report
+    val nangate45 = (RtlSynthesisEngine.synthesize(
+      preset.verilogCode, TargetLibrary.NANGATE45_45NM, OptimizationGoal.MIN_DELAY, 2.0
+    ) as SynthesisResult.Success).report
 
-    assertTrue("7nm should have smaller area than 130nm", asap7.totalAreaUm2 < sky130.totalAreaUm2)
+    assertTrue("7nm should have smaller area than 45nm", asap7.totalAreaUm2 < nangate45.totalAreaUm2)
+    assertTrue("45nm should have smaller area than 130nm", nangate45.totalAreaUm2 < sky130.totalAreaUm2)
+    assertTrue("130nm should have smaller area than 180nm", sky130.totalAreaUm2 < gf180.totalAreaUm2)
     assertTrue("7nm should be faster than 130nm", asap7.criticalPathDelayNs < sky130.criticalPathDelayNs)
+    assertTrue("130nm should be faster than 180nm", sky130.criticalPathDelayNs < gf180.criticalPathDelayNs)
   }
 
   @Test

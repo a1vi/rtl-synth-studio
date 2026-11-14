@@ -1,17 +1,18 @@
 package com.example.ui.viewmodel
 
-import android.util.Log
 import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.LocalDraftSnapshot
 import com.example.data.local.LocalWorkspaceStore
+import com.example.data.model.AppSettings
 import com.example.data.model.OptimizationGoal
 import com.example.data.model.RtlDesign
-import com.example.data.model.RtlWorkspaceDraft
+import com.example.data.model.RtlFileEntry
+import com.example.data.model.RtlLanguage
+import com.example.data.model.SynthesisEngineProfile
 import com.example.data.model.SynthesisRun
 import com.example.data.model.TargetLibrary
-import com.example.data.repository.RtlDesignRepository
 import com.example.domain.synth.GateNode
 import com.example.domain.synth.GateType
 import com.example.domain.synth.NetlistLayoutEngine
@@ -27,22 +28,14 @@ import com.example.domain.synth.SimulationResult
 import com.example.domain.synth.StimulusPattern
 import com.example.domain.synth.SynthesisReport
 import com.example.domain.synth.SynthesisResult
-import com.example.domain.synth.VerilogHdlParser
 import com.example.domain.synth.VerilogParseResult
-import com.google.firebase.Timestamp
-import com.google.firebase.firestore.FirebaseFirestoreException
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -58,6 +51,7 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 sealed interface UiState<out T> {
   data object Loading : UiState<Nothing>
@@ -69,49 +63,29 @@ enum class AutoSaveStatus {
   IDLE,
   SAVING,
   SAVED,
-  ERROR,
-  OFFLINE,
-}
-
-interface WorkspaceAutoSaveGateway {
-  suspend fun loadAutoSaveDraft(): Result<RtlWorkspaceDraft?>
-  suspend fun saveAutoSaveDraft(draft: RtlWorkspaceDraft, knownExists: Boolean?): Result<Unit>
-  suspend fun updateActiveDesign(design: RtlDesign): Result<Unit>
-  suspend fun getDesignById(designId: String): Result<RtlDesign?>
-}
-
-private class FirestoreAutoSaveGateway(
-  private val repository: RtlDesignRepository,
-) : WorkspaceAutoSaveGateway {
-  override suspend fun loadAutoSaveDraft(): Result<RtlWorkspaceDraft?> =
-    repository.getAutoSaveDraft()
-
-  override suspend fun saveAutoSaveDraft(
-    draft: RtlWorkspaceDraft,
-    knownExists: Boolean?,
-  ): Result<Unit> = repository.saveAutoSaveDraft(draft, knownExists = knownExists)
-
-  override suspend fun updateActiveDesign(design: RtlDesign): Result<Unit> =
-    repository.updateDesign(design)
-
-  override suspend fun getDesignById(designId: String): Result<RtlDesign?> =
-    repository.getDesignById(designId)
 }
 
 data class WorkbenchUiState(
-  val activeCloudDesignId: String? = null,
-  val activeCloudCreatedAt: Timestamp? = null,
+  val activeDesignId: String? = null,
   val designName: String = PresetRtlDesigns.templates.first().name,
   val description: String = PresetRtlDesigns.templates.first().description,
   val verilogCode: String = PresetRtlDesigns.templates.first().verilogCode,
   val targetLibrary: TargetLibrary = PresetRtlDesigns.templates.first().defaultLibrary,
   val optimizationGoal: OptimizationGoal = PresetRtlDesigns.templates.first().defaultGoal,
+  val synthesisEngine: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
   val clockPeriodNs: Double = PresetRtlDesigns.templates.first().defaultClockNs,
   val sdcText: String = "",
+  val files: List<RtlFileEntry> = emptyList(),
+  val openTabIds: List<String> = emptyList(),
+  val activeFileId: String = "file_rtl_top",
+  val primaryLanguage: RtlLanguage = PresetRtlDesigns.templates.first().language,
   val selectedTopModule: String? = null,
   val parsedDesign: ParsedVerilogDesign? = null,
   val parseError: VerilogParseResult.Error? = null,
   val synthesisResult: SynthesisResult? = null,
+  val synthesisProgress: Float = 1f,
+  val synthesisPhaseLabel: String = "Idle",
+  val lastRunDurationMs: Long = 0L,
   val selectedNodeId: String? = null,
   val manualNodePositions: Map<String, Offset> = emptyMap(),
   val isManualSchematic: Boolean = false,
@@ -119,17 +93,20 @@ data class WorkbenchUiState(
   val isSaving: Boolean = false,
   val statusBanner: String? = null,
   val hasUnsavedChanges: Boolean = false,
-  val isOfflineMode: Boolean = false,
-  val autoSaveStatus: AutoSaveStatus = if (isOfflineMode) AutoSaveStatus.OFFLINE else AutoSaveStatus.IDLE,
+  val autoSaveStatus: AutoSaveStatus = AutoSaveStatus.IDLE,
   val lastAutoSavedLabel: String? = null,
   val simulationResult: SimulationResult? = null,
   val simCycleCount: Int = 16,
   val stimulusPatterns: Map<String, StimulusPattern> = emptyMap(),
   val customSimValues: Map<Pair<String, Int>, Long> = emptyMap(),
-)
+  val selectedWaveformSignals: Set<String> = emptySet(),
+) {
+  val activeFile: RtlFileEntry?
+    get() = files.firstOrNull { it.id == activeFileId } ?: files.firstOrNull()
+}
 
 private data class ProjectSaveSignature(
-  val activeCloudDesignId: String,
+  val activeDesignId: String,
   val designName: String,
   val description: String,
   val verilogCode: String,
@@ -145,79 +122,35 @@ private data class ProjectSaveSignature(
 
 @OptIn(FlowPreview::class)
 class RtlSynthViewModel(
-  private val repository: RtlDesignRepository? = null,
-  private val currentUserId: String = "local_offline",
   private val localStore: LocalWorkspaceStore? = null,
-  private val isOfflineMode: Boolean = repository == null,
-  private val autoSaveGateway: WorkspaceAutoSaveGateway? =
-    if (!isOfflineMode && repository != null) FirestoreAutoSaveGateway(repository) else null,
   private val autoSaveIntervalMs: Long = DEFAULT_AUTOSAVE_INTERVAL_MS,
   private val autoSaveDebounceMs: Long = DEFAULT_AUTOSAVE_DEBOUNCE_MS,
   private val clockMillisProvider: () -> Long = { System.currentTimeMillis() },
 ) : ViewModel() {
 
-  val savedDesigns: StateFlow<UiState<List<RtlDesign>>> = if (!isOfflineMode && repository != null) {
-    repository.observeDesigns(currentUserId)
-      .map<List<RtlDesign>, UiState<List<RtlDesign>>> { UiState.Success(it) }
-      .catch { error ->
-        val firestoreError = generateSequence(error) { it.cause }
-          .filterIsInstance<FirebaseFirestoreException>()
-          .firstOrNull()
-        if (firestoreError == null && error is CancellationException) throw error
-        val rootError = firestoreError ?: error
-        Log.w(TAG, "Error observing saved designs", rootError)
-        emit(UiState.Error(rootError.message ?: "Failed to load saved designs"))
-      }
-      .stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-        initialValue = UiState.Loading,
-      )
-  } else {
+  val savedDesigns: StateFlow<UiState<List<RtlDesign>>> =
     (localStore?.localDesigns ?: flowOf(emptyList()))
       .map<List<RtlDesign>, UiState<List<RtlDesign>>> { UiState.Success(it) }
       .stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-        initialValue = UiState.Success(emptyList()),
+        initialValue = UiState.Success(localStore?.localDesigns?.value.orEmpty()),
       )
-  }
 
-  val synthesisRuns: StateFlow<UiState<List<SynthesisRun>>> = if (!isOfflineMode && repository != null) {
-    repository.observeSynthesisRuns(currentUserId)
-      .map<List<SynthesisRun>, UiState<List<SynthesisRun>>> { UiState.Success(it) }
-      .catch { error ->
-        val firestoreError = generateSequence(error) { it.cause }
-          .filterIsInstance<FirebaseFirestoreException>()
-          .firstOrNull()
-        if (firestoreError == null && error is CancellationException) throw error
-        val rootError = firestoreError ?: error
-        Log.w(TAG, "Error observing synthesis runs", rootError)
-        emit(UiState.Error(rootError.message ?: "Failed to load synthesis runs"))
-      }
-      .stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-        initialValue = UiState.Loading,
-      )
-  } else {
+  val synthesisRuns: StateFlow<UiState<List<SynthesisRun>>> =
     (localStore?.localRuns ?: flowOf(emptyList()))
       .map<List<SynthesisRun>, UiState<List<SynthesisRun>>> { UiState.Success(it) }
       .stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-        initialValue = UiState.Success(emptyList()),
+        initialValue = UiState.Success(localStore?.localRuns?.value.orEmpty()),
       )
-  }
 
-  val localPendingDesigns: StateFlow<List<RtlDesign>> =
-    localStore?.localDesigns ?: MutableStateFlow(emptyList())
+  private val _settings = MutableStateFlow(localStore?.loadSettings() ?: AppSettings())
+  val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
   private val autoSaveMutex = Mutex()
-  private var initialLocalDraft: LocalDraftSnapshot? = null
-  private var userEditedSinceStartup: Boolean = false
-  private var dirtyForCloudAutoSave: Boolean = false
-  private var cloudAutoSaveExists: Boolean? = null
+  private var dirtyForAutoSave: Boolean = false
   private var lastAutoSavedSignature: ProjectSaveSignature? = null
 
   private val _workbench = MutableStateFlow(createInitialState())
@@ -226,54 +159,77 @@ class RtlSynthViewModel(
   init {
     refreshLiveParse()
     runSynthesis()
-    startCloudAutoSaveLoops()
+    startLocalAutoSaveLoops()
   }
 
   private fun createInitialState(): WorkbenchUiState {
+    val loadedSettings = _settings.value
     val draft = localStore?.loadActiveDraft()
-    initialLocalDraft = draft
-    val base = if (draft != null) {
+    return if (draft != null) {
+      val restoredLabel = if (draft.savedAtEpochMs > 0L) formatClockTime(draft.savedAtEpochMs) else null
+      val lang = RtlProjectHelpers.detectPrimaryRtlLanguage(draft.verilogCode)
+      val files = if (draft.files.isNotEmpty()) {
+        draft.files
+      } else {
+        RtlProjectHelpers.buildDefaultFiles(
+          designName = draft.designName,
+          rtlCode = draft.verilogCode,
+          language = lang,
+          sdcText = draft.sdcText,
+        )
+      }
+      val activeId = draft.activeFileId?.takeIf { id -> files.any { it.id == id } } ?: files.first().id
       WorkbenchUiState(
+        activeDesignId = draft.activeDesignId,
         designName = draft.designName,
         description = draft.description,
         verilogCode = draft.verilogCode,
         sdcText = draft.sdcText,
+        files = files,
+        openTabIds = files.map { it.id },
+        activeFileId = activeId,
+        primaryLanguage = lang,
         targetLibrary = draft.targetLibrary,
         optimizationGoal = draft.optimizationGoal,
+        synthesisEngine = loadedSettings.defaultEngine,
         clockPeriodNs = draft.clockPeriodNs,
-        isOfflineMode = isOfflineMode,
-        autoSaveStatus = if (isOfflineMode) AutoSaveStatus.OFFLINE else AutoSaveStatus.IDLE,
+        autoSaveStatus = AutoSaveStatus.SAVED,
+        lastAutoSavedLabel = restoredLabel,
       )
     } else {
       val first = PresetRtlDesigns.templates.first()
-      val parsed = (VerilogHdlParser.parse(first.verilogCode) as? VerilogParseResult.Success)?.design
+      val parsed = (RtlProjectHelpers.parseLanguageAware(first.verilogCode, null) as? VerilogParseResult.Success)?.design
       val initialSdc = SdcParser.generateDefaultSdc(
         moduleName = first.name,
         ports = parsed?.topModule?.ports.orEmpty(),
         clockPeriodNs = first.defaultClockNs,
       )
+      val files = RtlProjectHelpers.buildFilesFromPreset(first, initialSdc)
       WorkbenchUiState(
         designName = first.name,
         description = first.description,
         verilogCode = first.verilogCode,
         sdcText = initialSdc,
+        files = files,
+        openTabIds = files.map { it.id },
+        activeFileId = files.first().id,
+        primaryLanguage = first.language,
         targetLibrary = first.defaultLibrary,
         optimizationGoal = first.defaultGoal,
+        synthesisEngine = loadedSettings.defaultEngine,
         clockPeriodNs = first.defaultClockNs,
-        isOfflineMode = isOfflineMode,
-        autoSaveStatus = if (isOfflineMode) AutoSaveStatus.OFFLINE else AutoSaveStatus.IDLE,
+        autoSaveStatus = AutoSaveStatus.IDLE,
       )
     }
-    return base
   }
 
-  private fun persistDraft(state: WorkbenchUiState, markDirtyForAutoSave: Boolean = true) {
-    if (markDirtyForAutoSave) {
-      userEditedSinceStartup = true
-      dirtyForCloudAutoSave = true
+  private fun persistDraft(state: WorkbenchUiState, markDirty: Boolean = true) {
+    if (markDirty) {
+      dirtyForAutoSave = true
     }
     localStore?.saveActiveDraft(
       LocalDraftSnapshot(
+        activeDesignId = state.activeDesignId,
         designName = state.designName,
         description = state.description,
         verilogCode = state.verilogCode,
@@ -282,6 +238,8 @@ class RtlSynthViewModel(
         optimizationGoal = state.optimizationGoal,
         clockPeriodNs = state.clockPeriodNs,
         savedAtEpochMs = clockMillisProvider(),
+        files = state.files,
+        activeFileId = state.activeFileId,
       )
     )
   }
@@ -289,7 +247,7 @@ class RtlSynthViewModel(
   private fun WorkbenchUiState.toSaveSignature(): ProjectSaveSignature {
     val report = (synthesisResult as? SynthesisResult.Success)?.report
     return ProjectSaveSignature(
-      activeCloudDesignId = activeCloudDesignId.orEmpty(),
+      activeDesignId = activeDesignId.orEmpty(),
       designName = designName.trim(),
       description = description.trim(),
       verilogCode = verilogCode,
@@ -304,22 +262,23 @@ class RtlSynthViewModel(
     )
   }
 
-  private fun startCloudAutoSaveLoops() {
-    if (isOfflineMode || autoSaveGateway == null) return
+  private fun startLocalAutoSaveLoops() {
+    if (localStore == null) return
 
-    viewModelScope.launch {
-      recoverCloudAutoSaveIfNewer()
-    }
-
-    // Periodic interval auto-save to Firestore
     viewModelScope.launch {
       while (isActive) {
-        delay(autoSaveIntervalMs)
-        performAutoSaveIfDirty()
+        val intervalMs = if (autoSaveIntervalMs != DEFAULT_AUTOSAVE_INTERVAL_MS) {
+          autoSaveIntervalMs
+        } else {
+          (_settings.value.autoSaveIntervalSec * 1000L).coerceAtLeast(5_000L)
+        }
+        delay(intervalMs)
+        if (_settings.value.autoSaveIntervalSec > 0 || autoSaveIntervalMs != DEFAULT_AUTOSAVE_INTERVAL_MS) {
+          performAutoSaveIfDirty()
+        }
       }
     }
 
-    // Short debounce after edits settle so progress is saved promptly even between intervals
     viewModelScope.launch {
       _workbench
         .map { it.toSaveSignature() }
@@ -327,167 +286,90 @@ class RtlSynthViewModel(
         .drop(1)
         .debounce(autoSaveDebounceMs)
         .collect {
-          performAutoSaveIfDirty()
+          if (_settings.value.autoSaveIntervalSec > 0 || autoSaveIntervalMs != DEFAULT_AUTOSAVE_INTERVAL_MS) {
+            performAutoSaveIfDirty()
+          }
         }
     }
-  }
-
-  private suspend fun recoverCloudAutoSaveIfNewer() {
-    val gateway = autoSaveGateway ?: return
-    val result = gateway.loadAutoSaveDraft()
-    val cloudDraft = result.getOrNull()
-    if (cloudDraft != null) {
-      cloudAutoSaveExists = true
-    } else if (result.isSuccess) {
-      cloudAutoSaveExists = false
-      return
-    } else {
-      return
-    }
-
-    if (userEditedSinceStartup || cloudDraft.verilogCode.isBlank()) return
-
-    val cloudUpdatedMs = cloudDraft.updatedAt?.toDate()?.time ?: 0L
-    val localSavedMs = initialLocalDraft?.savedAtEpochMs ?: 0L
-    val shouldRestore = initialLocalDraft == null || cloudUpdatedMs > localSavedMs
-    if (!shouldRestore) return
-
-    val restoredDesignId = cloudDraft.activeCloudDesignId.ifBlank { null }
-    val resolvedCreatedAt = if (restoredDesignId != null && !restoredDesignId.startsWith("local_")) {
-      gateway.getDesignById(restoredDesignId).getOrNull()?.createdAt
-    } else {
-      null
-    }
-
-    val restoredLib = TargetLibrary.fromId(cloudDraft.targetLibrary)
-    val restoredGoal = OptimizationGoal.fromId(cloudDraft.optimizationGoal)
-    val restoredLabel = formatClockTime(if (cloudUpdatedMs > 0L) cloudUpdatedMs else clockMillisProvider())
-
-    _workbench.update { current ->
-      applyParseToState(
-        current.copy(
-          activeCloudDesignId = restoredDesignId,
-          activeCloudCreatedAt = resolvedCreatedAt,
-          designName = cloudDraft.designName.ifBlank { "rtl_module" },
-          description = cloudDraft.description,
-          verilogCode = cloudDraft.verilogCode,
-          sdcText = cloudDraft.sdcText,
-          targetLibrary = restoredLib,
-          optimizationGoal = restoredGoal,
-          clockPeriodNs = cloudDraft.clockPeriodNs.coerceIn(0.4, 50.0),
-          hasUnsavedChanges = false,
-          autoSaveStatus = AutoSaveStatus.SAVED,
-          lastAutoSavedLabel = restoredLabel,
-          statusBanner = "Restored auto-saved workspace '${cloudDraft.designName.ifBlank { "rtl_module" }}' from cloud.",
-        )
-      )
-    }
-
-    localStore?.saveActiveDraft(
-      LocalDraftSnapshot(
-        designName = _workbench.value.designName,
-        description = _workbench.value.description,
-        verilogCode = _workbench.value.verilogCode,
-        sdcText = _workbench.value.sdcText,
-        targetLibrary = restoredLib,
-        optimizationGoal = restoredGoal,
-        clockPeriodNs = _workbench.value.clockPeriodNs,
-        savedAtEpochMs = cloudUpdatedMs.coerceAtLeast(clockMillisProvider()),
-      )
-    )
-    lastAutoSavedSignature = _workbench.value.toSaveSignature()
-    dirtyForCloudAutoSave = false
-    runSynthesis()
   }
 
   fun flushAutoSave() {
-    persistDraft(_workbench.value, markDirtyForAutoSave = false)
-    if (isOfflineMode || autoSaveGateway == null) return
-    viewModelScope.launch {
-      withContext(NonCancellable) {
-        performAutoSaveIfDirty()
-      }
-    }
+    val state = _workbench.value
+    persistDraft(state, markDirty = false)
+    if (localStore == null) return
+    performAutoSaveSync(state)
   }
 
   suspend fun performAutoSaveIfDirty() {
-    val gateway = autoSaveGateway ?: return
-    if (isOfflineMode) return
+    if (localStore == null) return
     autoSaveMutex.withLock {
       val state = _workbench.value
       val sig = state.toSaveSignature()
-      if (!dirtyForCloudAutoSave && sig == lastAutoSavedSignature) return
-      if (!dirtyForCloudAutoSave) return
+      if (!dirtyForAutoSave && sig == lastAutoSavedSignature) return
+      if (!dirtyForAutoSave) return
+      performAutoSaveSync(state)
+    }
+  }
 
-      _workbench.update { it.copy(autoSaveStatus = AutoSaveStatus.SAVING) }
+  private fun performAutoSaveSync(state: WorkbenchUiState) {
+    val store = localStore ?: return
+    val sig = state.toSaveSignature()
+    if (!dirtyForAutoSave && sig == lastAutoSavedSignature) return
 
-      val report = (state.synthesisResult as? SynthesisResult.Success)?.report
-      val draftPayload = RtlWorkspaceDraft(
-        id = RtlDesignRepository.DEFAULT_AUTOSAVE_ID,
-        userId = currentUserId,
-        activeCloudDesignId = state.activeCloudDesignId.orEmpty(),
-        designName = state.designName.trim().take(80),
-        description = state.description.trim().take(300),
-        verilogCode = state.verilogCode.take(20000),
-        sdcText = state.sdcText.take(10000),
-        targetLibrary = state.targetLibrary.id,
-        optimizationGoal = state.optimizationGoal.id,
-        clockPeriodNs = state.clockPeriodNs.coerceIn(0.4, 1000.0),
-        lastWnsNs = report?.wnsNs ?: 0.0,
-        lastAreaUm2 = report?.totalAreaUm2 ?: 0.0,
-        lastCellCount = (report?.cellCount ?: 0).toLong(),
-        lastPowerMw = report?.totalPowerMw ?: 0.0,
+    _workbench.update { it.copy(autoSaveStatus = AutoSaveStatus.SAVING) }
+    val nowMs = clockMillisProvider()
+    store.saveActiveDraft(
+      LocalDraftSnapshot(
+        activeDesignId = state.activeDesignId,
+        designName = state.designName,
+        description = state.description,
+        verilogCode = state.verilogCode,
+        sdcText = state.sdcText,
+        targetLibrary = state.targetLibrary,
+        optimizationGoal = state.optimizationGoal,
+        clockPeriodNs = state.clockPeriodNs,
+        savedAtEpochMs = nowMs,
+        files = state.files,
+        activeFileId = state.activeFileId,
       )
+    )
 
-      val draftResult = gateway.saveAutoSaveDraft(draftPayload, knownExists = cloudAutoSaveExists)
-      if (draftResult.isSuccess) {
-        cloudAutoSaveExists = true
-        lastAutoSavedSignature = sig
-        val activeId = state.activeCloudDesignId
-        val activeCreatedAt = state.activeCloudCreatedAt
-        var syncedActiveDesign = false
-        if (
-          activeId != null &&
-          !activeId.startsWith("local_") &&
-          activeCreatedAt != null &&
-          state.designName.isNotBlank() &&
-          state.verilogCode.isNotBlank()
-        ) {
-          val updateOutcome = gateway.updateActiveDesign(
-            RtlDesign(
-              id = activeId,
-              userId = currentUserId,
-              name = state.designName.trim(),
-              description = state.description.trim(),
-              verilogCode = state.verilogCode,
-              targetLibrary = state.targetLibrary.id,
-              optimizationGoal = state.optimizationGoal.id,
-              clockPeriodNs = state.clockPeriodNs,
-              lastWnsNs = report?.wnsNs ?: 0.0,
-              lastAreaUm2 = report?.totalAreaUm2 ?: 0.0,
-              lastCellCount = (report?.cellCount ?: 0).toLong(),
-              lastPowerMw = report?.totalPowerMw ?: 0.0,
-              createdAt = activeCreatedAt,
-            )
-          )
-          syncedActiveDesign = updateOutcome.isSuccess
-        }
+    val report = (state.synthesisResult as? SynthesisResult.Success)?.report
+    val activeId = state.activeDesignId
+    var syncedActive = false
+    if (!activeId.isNullOrBlank() && state.designName.isNotBlank() && state.verilogCode.isNotBlank()) {
+      store.upsertLocalDesign(
+        RtlDesign(
+          id = activeId,
+          name = state.designName.trim(),
+          description = state.description.trim(),
+          verilogCode = state.verilogCode,
+          targetLibrary = state.targetLibrary.id,
+          optimizationGoal = state.optimizationGoal.id,
+          clockPeriodNs = state.clockPeriodNs,
+          lastWnsNs = report?.wnsNs ?: 0.0,
+          lastAreaUm2 = report?.totalAreaUm2 ?: 0.0,
+          lastCellCount = (report?.cellCount ?: 0).toLong(),
+          lastPowerMw = report?.totalPowerMw ?: 0.0,
+          language = state.primaryLanguage.name,
+          files = state.files,
+        )
+      )
+      syncedActive = true
+    }
 
-        val currentSigAfterSave = _workbench.value.toSaveSignature()
-        if (currentSigAfterSave == sig) {
-          dirtyForCloudAutoSave = false
-        }
-        val savedTime = formatClockTime(clockMillisProvider())
-        _workbench.update {
-          it.copy(
-            autoSaveStatus = AutoSaveStatus.SAVED,
-            lastAutoSavedLabel = savedTime,
-            hasUnsavedChanges = if (syncedActiveDesign && currentSigAfterSave == sig) false else it.hasUnsavedChanges,
-          )
-        }
-      } else {
-        _workbench.update { it.copy(autoSaveStatus = AutoSaveStatus.ERROR) }
-      }
+    val currentSigAfter = _workbench.value.toSaveSignature()
+    if (currentSigAfter == sig) {
+      dirtyForAutoSave = false
+    }
+    lastAutoSavedSignature = sig
+    val savedTime = formatClockTime(nowMs)
+    _workbench.update {
+      it.copy(
+        autoSaveStatus = AutoSaveStatus.SAVED,
+        lastAutoSavedLabel = savedTime,
+        hasUnsavedChanges = if (syncedActive && currentSigAfter == sig) false else it.hasUnsavedChanges,
+      )
     }
   }
 
@@ -497,37 +379,13 @@ class RtlSynthViewModel(
   }
 
   override fun onCleared() {
-    persistDraft(_workbench.value, markDirtyForAutoSave = false)
-    val gateway = autoSaveGateway
-    if (!isOfflineMode && gateway != null && dirtyForCloudAutoSave) {
-      val state = _workbench.value
-      val report = (state.synthesisResult as? SynthesisResult.Success)?.report
-      val draftPayload = RtlWorkspaceDraft(
-        id = RtlDesignRepository.DEFAULT_AUTOSAVE_ID,
-        userId = currentUserId,
-        activeCloudDesignId = state.activeCloudDesignId.orEmpty(),
-        designName = state.designName.trim().take(80),
-        description = state.description.trim().take(300),
-        verilogCode = state.verilogCode.take(20000),
-        sdcText = state.sdcText.take(10000),
-        targetLibrary = state.targetLibrary.id,
-        optimizationGoal = state.optimizationGoal.id,
-        clockPeriodNs = state.clockPeriodNs.coerceIn(0.4, 1000.0),
-        lastWnsNs = report?.wnsNs ?: 0.0,
-        lastAreaUm2 = report?.totalAreaUm2 ?: 0.0,
-        lastCellCount = (report?.cellCount ?: 0).toLong(),
-        lastPowerMw = report?.totalPowerMw ?: 0.0,
-      )
-      val existsSnapshot = cloudAutoSaveExists
-      CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-        gateway.saveAutoSaveDraft(draftPayload, knownExists = existsSnapshot)
-      }
-    }
+    flushAutoSave()
     super.onCleared()
   }
 
   private fun applyParseToState(state: WorkbenchUiState): WorkbenchUiState {
-    return when (val parsed = VerilogHdlParser.parse(state.verilogCode, state.selectedTopModule)) {
+    val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(state.files, state.verilogCode)
+    return when (val parsed = RtlProjectHelpers.parseLanguageAware(combinedRtl, state.selectedTopModule)) {
       is VerilogParseResult.Success -> {
         val validTop = state.selectedTopModule?.takeIf { sel ->
           parsed.design.modules.any { it.name == sel }
@@ -557,11 +415,150 @@ class RtlSynthViewModel(
     _workbench.update { applyParseToState(it) }
   }
 
+  // ==================== MULTI-FILE & EDITOR ACTIONS ====================
+
+  fun updateActiveFileContent(content: String) {
+    val current = _workbench.value
+    val active = current.activeFile
+    if (active == null) {
+      updateVerilogCode(content)
+      return
+    }
+    when (active.language) {
+      RtlLanguage.SDC -> {
+        val updatedFiles = current.files.map { if (it.id == active.id) it.copy(content = content) else it }
+        val parsedSdc = SdcParser.parse(content, current.clockPeriodNs)
+        val nextPeriod = parsedSdc.primaryClockPeriodNs?.coerceIn(0.4, 50.0) ?: current.clockPeriodNs
+        _workbench.update {
+          it.copy(
+            files = updatedFiles,
+            sdcText = content,
+            clockPeriodNs = nextPeriod,
+            hasUnsavedChanges = true,
+          ).also(::persistDraft)
+        }
+      }
+      RtlLanguage.TESTBENCH -> {
+        val updatedFiles = current.files.map { if (it.id == active.id) it.copy(content = content) else it }
+        _workbench.update {
+          it.copy(
+            files = updatedFiles,
+            hasUnsavedChanges = true,
+          ).also(::persistDraft)
+        }
+      }
+      RtlLanguage.VERILOG, RtlLanguage.SYSTEM_VERILOG, RtlLanguage.VHDL -> {
+        val updatedFiles = current.files.map { if (it.id == active.id) it.copy(content = content) else it }
+        val isPrimary = active.id == "file_rtl_top" || current.files.none { it.id == "file_rtl_top" }
+        val primaryCode = if (isPrimary) content else current.verilogCode
+        val detectedLang = if (isPrimary) {
+          RtlProjectHelpers.detectPrimaryRtlLanguage(content, active.name)
+        } else {
+          current.primaryLanguage
+        }
+        _workbench.update { state ->
+          applyParseToState(
+            state.copy(
+              files = updatedFiles,
+              verilogCode = primaryCode,
+              primaryLanguage = detectedLang,
+              hasUnsavedChanges = true,
+            )
+          ).also(::persistDraft)
+        }
+      }
+    }
+  }
+
   fun updateVerilogCode(code: String) {
     _workbench.update { state ->
-      applyParseToState(state.copy(verilogCode = code, hasUnsavedChanges = true)).also {
-        persistDraft(it)
+      val updatedFiles = if (state.files.isEmpty()) {
+        state.files
+      } else {
+        val targetId = state.files.firstOrNull { it.id == "file_rtl_top" }?.id
+          ?: state.files.firstOrNull {
+            it.language == RtlLanguage.VERILOG ||
+              it.language == RtlLanguage.SYSTEM_VERILOG ||
+              it.language == RtlLanguage.VHDL
+          }?.id
+        if (targetId != null) {
+          state.files.map { if (it.id == targetId) it.copy(content = code) else it }
+        } else {
+          state.files
+        }
       }
+      val lang = RtlProjectHelpers.detectPrimaryRtlLanguage(code)
+      applyParseToState(
+        state.copy(
+          verilogCode = code,
+          files = updatedFiles,
+          primaryLanguage = lang,
+          hasUnsavedChanges = true,
+        )
+      ).also(::persistDraft)
+    }
+  }
+
+  fun selectFileTab(fileId: String) {
+    _workbench.update { state ->
+      if (state.files.none { it.id == fileId }) return@update state
+      val nextTabs = if (fileId in state.openTabIds) state.openTabIds else state.openTabIds + fileId
+      state.copy(activeFileId = fileId, openTabIds = nextTabs)
+    }
+  }
+
+  fun closeFileTab(fileId: String) {
+    _workbench.update { state ->
+      if (state.openTabIds.size <= 1) return@update state
+      val remaining = state.openTabIds.filterNot { it == fileId }
+      val nextActive = if (state.activeFileId == fileId) remaining.last() else state.activeFileId
+      state.copy(openTabIds = remaining, activeFileId = nextActive)
+    }
+  }
+
+  fun addProjectFile(fileName: String, language: RtlLanguage) {
+    val cleanName = fileName.trim().ifBlank { "module_${_workbench.value.files.size + 1}.${language.extension}" }
+    val normalizedName = if ('.' in cleanName) cleanName else "$cleanName.${language.extension}"
+    val modBase = normalizedName.substringBeforeLast('.').replace(Regex("[^a-zA-Z0-9_]"), "_")
+    val templateContent = when (language) {
+      RtlLanguage.SYSTEM_VERILOG -> "module $modBase (\n  input logic clk,\n  input logic a,\n  output logic y\n);\n  assign y = a;\nendmodule"
+      RtlLanguage.VHDL -> "library ieee;\nuse ieee.std_logic_1164.all;\n\nentity $modBase is\n  port (\n    a : in  std_logic;\n    y : out std_logic\n  );\nend entity $modBase;\n\narchitecture rtl of $modBase is\nbegin\n  y <= a;\nend architecture rtl;"
+      RtlLanguage.SDC -> "create_clock -name clk -period ${_workbench.value.clockPeriodNs} [get_ports clk]\n"
+      RtlLanguage.TESTBENCH -> RtlProjectHelpers.defaultTestbenchFor(_workbench.value.designName)
+      RtlLanguage.VERILOG -> "module $modBase (\n  input wire a,\n  output wire y\n);\n  assign y = a;\nendmodule"
+    }
+    val entry = RtlFileEntry(
+      id = "file_${UUID.randomUUID().toString().take(8)}",
+      name = normalizedName,
+      language = language,
+      content = templateContent,
+    )
+    _workbench.update { state ->
+      val updatedFiles = state.files + entry
+      state.copy(
+        files = updatedFiles,
+        openTabIds = state.openTabIds + entry.id,
+        activeFileId = entry.id,
+        hasUnsavedChanges = true,
+        statusBanner = "Added $normalizedName to project.",
+      ).also(::persistDraft)
+    }
+  }
+
+  fun deleteProjectFile(fileId: String) {
+    _workbench.update { state ->
+      if (state.files.size <= 1 || fileId == "file_rtl_top") return@update state
+      val updatedFiles = state.files.filterNot { it.id == fileId }
+      val updatedTabs = state.openTabIds.filterNot { it == fileId }.ifEmpty { listOf(updatedFiles.first().id) }
+      val nextActive = if (state.activeFileId == fileId) updatedTabs.first() else state.activeFileId
+      applyParseToState(
+        state.copy(
+          files = updatedFiles,
+          openTabIds = updatedTabs,
+          activeFileId = nextActive,
+          hasUnsavedChanges = true,
+        )
+      ).also(::persistDraft)
     }
   }
 
@@ -606,6 +603,11 @@ class RtlSynthViewModel(
     }
   }
 
+  fun selectSynthesisEngine(engine: SynthesisEngineProfile) {
+    _workbench.update { it.copy(synthesisEngine = engine, hasUnsavedChanges = true).also(::persistDraft) }
+    runSynthesis()
+  }
+
   fun updateClockPeriodNs(periodNs: Double) {
     val clamped = periodNs.coerceIn(0.4, 50.0)
     _workbench.update { state ->
@@ -614,9 +616,13 @@ class RtlSynthViewModel(
       } else {
         state.sdcText
       }
+      val updatedFiles = state.files.map { f ->
+        if (f.language == RtlLanguage.SDC) f.copy(content = syncedSdc) else f
+      }
       state.copy(
         clockPeriodNs = clamped,
         sdcText = syncedSdc,
+        files = updatedFiles,
         hasUnsavedChanges = true,
       ).also(::persistDraft)
     }
@@ -632,9 +638,13 @@ class RtlSynthViewModel(
   fun updateSdcConstraints(sdc: String) {
     val parsedSdc = SdcParser.parse(sdc, _workbench.value.clockPeriodNs)
     val nextPeriod = parsedSdc.primaryClockPeriodNs?.coerceIn(0.4, 50.0) ?: _workbench.value.clockPeriodNs
-    _workbench.update {
-      it.copy(
+    _workbench.update { state ->
+      val updatedFiles = state.files.map { f ->
+        if (f.language == RtlLanguage.SDC) f.copy(content = sdc) else f
+      }
+      state.copy(
         sdcText = sdc,
+        files = updatedFiles,
         clockPeriodNs = nextPeriod,
         hasUnsavedChanges = true,
       ).also(::persistDraft)
@@ -658,10 +668,28 @@ class RtlSynthViewModel(
 
   fun importFileContent(fileName: String, content: String) {
     val cleanName = fileName.trim()
-    val lower = cleanName.lowercase(Locale.ROOT)
-    if (lower.endsWith(".sdc")) {
+    val lang = RtlLanguage.fromFileName(cleanName)
+    if (lang == RtlLanguage.SDC) {
       updateSdcConstraints(content)
       _workbench.update { it.copy(statusBanner = "Imported SDC constraints from $cleanName.") }
+      return
+    }
+    if (lang == RtlLanguage.TESTBENCH) {
+      val tbEntry = RtlFileEntry(
+        id = "file_tb",
+        name = cleanName,
+        language = RtlLanguage.TESTBENCH,
+        content = content,
+      )
+      _workbench.update { state ->
+        val filtered = state.files.filterNot { it.id == "file_tb" } + tbEntry
+        state.copy(
+          files = filtered,
+          openTabIds = (state.openTabIds + tbEntry.id).distinct(),
+          activeFileId = tbEntry.id,
+          statusBanner = "Imported testbench $cleanName.",
+        ).also(::persistDraft)
+      }
       return
     }
 
@@ -671,31 +699,44 @@ class RtlSynthViewModel(
       .substringBeforeLast('.')
       .ifBlank { "imported_module" }
 
-    val parsed = VerilogHdlParser.parse(content)
+    val parsed = RtlProjectHelpers.parseLanguageAware(content, null)
     val resolvedName = (parsed as? VerilogParseResult.Success)?.design?.topModule?.name ?: baseName
     val resolvedSdc = (parsed as? VerilogParseResult.Success)?.let { p ->
       SdcParser.generateDefaultSdc(resolvedName, p.design.topModule.ports, _workbench.value.clockPeriodNs)
     } ?: _workbench.value.sdcText
+    val detectedLang = RtlProjectHelpers.detectPrimaryRtlLanguage(content, cleanName)
+    val files = RtlProjectHelpers.buildDefaultFiles(
+      designName = resolvedName,
+      rtlCode = content,
+      language = detectedLang,
+      sdcText = resolvedSdc,
+    )
 
     _workbench.update { state ->
       applyParseToState(
         state.copy(
-          activeCloudDesignId = null,
-          activeCloudCreatedAt = null,
+          activeDesignId = null,
           designName = resolvedName,
           description = "Imported from $cleanName",
           verilogCode = content,
           sdcText = resolvedSdc,
+          files = files,
+          openTabIds = files.map { it.id },
+          activeFileId = files.first().id,
+          primaryLanguage = detectedLang,
           selectedTopModule = null,
           hasUnsavedChanges = true,
           stimulusPatterns = emptyMap(),
           customSimValues = emptyMap(),
-          statusBanner = "Imported $cleanName into editor.",
+          selectedWaveformSignals = emptySet(),
+          statusBanner = "Imported $cleanName into IDE.",
         )
       ).also(::persistDraft)
     }
     runSynthesis()
   }
+
+  // ==================== SCHEMATIC ACTIONS ====================
 
   fun selectNode(nodeId: String?) {
     _workbench.update { it.copy(selectedNodeId = nodeId) }
@@ -731,10 +772,7 @@ class RtlSynthViewModel(
     runSynthesis()
   }
 
-  fun addPrimitiveToSchematic(
-    gateType: GateType,
-    worldPosition: Offset? = null,
-  ) {
+  fun addPrimitiveToSchematic(gateType: GateType, worldPosition: Offset? = null) {
     val state = _workbench.value
     val baseReport = (state.synthesisResult as? SynthesisResult.Success)?.report
       ?: RtlSynthesisEngine.createBlankManualReport(
@@ -813,10 +851,7 @@ class RtlSynthViewModel(
     }
 
     val clampedPos = worldPosition?.let {
-      Offset(
-        x = it.x.coerceAtLeast(16f),
-        y = it.y.coerceAtLeast(16f),
-      )
+      Offset(x = it.x.coerceAtLeast(16f), y = it.y.coerceAtLeast(16f))
     } ?: Offset(
       x = NetlistLayoutEngine.WORLD_PADDING + (existingNodes.count { !it.gateType.isPort } % 3 + 1) * 180f,
       y = NetlistLayoutEngine.WORLD_PADDING + (existingNodes.size % 4) * 92f,
@@ -943,7 +978,7 @@ class RtlSynthViewModel(
         statusBanner = banner ?: it.statusBanner,
       )
     }
-    dirtyForCloudAutoSave = true
+    dirtyForAutoSave = true
     runSimulation()
   }
 
@@ -961,67 +996,130 @@ class RtlSynthViewModel(
     _workbench.update { it.copy(statusBanner = null) }
   }
 
+  // ==================== PROJECT & PRESET LOADING ====================
+
   fun loadPreset(template: RtlPresetTemplate) {
-    val parsed = (VerilogHdlParser.parse(template.verilogCode) as? VerilogParseResult.Success)?.design
+    val parsed = (RtlProjectHelpers.parseLanguageAware(template.verilogCode, null) as? VerilogParseResult.Success)?.design
     val defaultSdc = SdcParser.generateDefaultSdc(
       moduleName = template.name,
       ports = parsed?.topModule?.ports.orEmpty(),
       clockPeriodNs = template.defaultClockNs,
     )
+    val files = RtlProjectHelpers.buildFilesFromPreset(template, defaultSdc)
     _workbench.update {
       applyParseToState(
         WorkbenchUiState(
-          activeCloudDesignId = null,
-          activeCloudCreatedAt = null,
+          activeDesignId = null,
           designName = template.name,
           description = template.description,
           verilogCode = template.verilogCode,
           sdcText = defaultSdc,
+          files = files,
+          openTabIds = files.map { f -> f.id },
+          activeFileId = files.first().id,
+          primaryLanguage = template.language,
           targetLibrary = template.defaultLibrary,
           optimizationGoal = template.defaultGoal,
+          synthesisEngine = _settings.value.defaultEngine,
           clockPeriodNs = template.defaultClockNs,
           hasUnsavedChanges = false,
-          isOfflineMode = isOfflineMode,
         )
       ).also(::persistDraft)
     }
     runSynthesis()
   }
 
-  fun startBlankDesign() {
-    val code = """
-module custom_rtl_module (
-  input wire clk,
-  input wire rst,
-  input wire [3:0] a,
-  input wire [3:0] b,
-  output reg [3:0] y
-);
-  always @(posedge clk) begin
-    if (rst) begin
-      y <= 4'd0;
-    end else begin
-      y <= a + b;
-    end
-  end
-endmodule
-    """.trimIndent()
-    val parsed = (VerilogHdlParser.parse(code) as? VerilogParseResult.Success)?.design
-    val sdc = SdcParser.generateDefaultSdc("custom_rtl_module", parsed?.topModule?.ports.orEmpty(), 2.5)
+  fun startBlankDesign(
+    projectName: String = "custom_rtl_module",
+    language: RtlLanguage = RtlLanguage.VERILOG,
+    library: TargetLibrary = _settings.value.defaultLibrary,
+  ) {
+    val cleanMod = projectName.trim().ifBlank { "custom_rtl_module" }
+      .replace(Regex("[^a-zA-Z0-9_]"), "_")
+    val code = when (language) {
+      RtlLanguage.VHDL -> """
+        library ieee;
+        use ieee.std_logic_1164.all;
+
+        entity $cleanMod is
+          port (
+            clk : in  std_logic;
+            rst : in  std_logic;
+            a   : in  std_logic_vector(3 downto 0);
+            b   : in  std_logic_vector(3 downto 0);
+            y   : out std_logic_vector(3 downto 0)
+          );
+        end entity $cleanMod;
+
+        architecture rtl of $cleanMod is
+        begin
+          process(clk)
+          begin
+            if rising_edge(clk) then
+              if rst = '1' then
+                y <= "0000";
+              else
+                y <= a + b;
+              end if;
+            end if;
+          end process;
+        end architecture rtl;
+      """.trimIndent()
+      RtlLanguage.SYSTEM_VERILOG -> """
+        module $cleanMod (
+          input  logic       clk,
+          input  logic       rst,
+          input  logic [3:0] a,
+          input  logic [3:0] b,
+          output logic [3:0] y
+        );
+          always_ff @(posedge clk) begin
+            if (rst) begin
+              y <= 4'd0;
+            end else begin
+              y <= a + b;
+            end
+          end
+        endmodule
+      """.trimIndent()
+      else -> """
+        module $cleanMod (
+          input wire clk,
+          input wire rst,
+          input wire [3:0] a,
+          input wire [3:0] b,
+          output reg [3:0] y
+        );
+          always @(posedge clk) begin
+            if (rst) begin
+              y <= 4'd0;
+            end else begin
+              y <= a + b;
+            end
+          end
+        endmodule
+      """.trimIndent()
+    }
+    val parsed = (RtlProjectHelpers.parseLanguageAware(code, null) as? VerilogParseResult.Success)?.design
+    val sdc = SdcParser.generateDefaultSdc(cleanMod, parsed?.topModule?.ports.orEmpty(), 2.5)
+    val files = RtlProjectHelpers.buildDefaultFiles(cleanMod, code, language, sdc)
     _workbench.update {
       applyParseToState(
         WorkbenchUiState(
-          activeCloudDesignId = null,
-          activeCloudCreatedAt = null,
-          designName = "custom_rtl_module",
-          description = "Custom synthesizable Verilog RTL module",
+          activeDesignId = null,
+          designName = cleanMod,
+          description = "Custom synthesizable ${language.displayName} RTL project",
           verilogCode = code,
           sdcText = sdc,
-          targetLibrary = TargetLibrary.ASAP7_7NM,
+          files = files,
+          openTabIds = files.map { f -> f.id },
+          activeFileId = files.first().id,
+          primaryLanguage = language,
+          targetLibrary = library,
           optimizationGoal = OptimizationGoal.BALANCED,
+          synthesisEngine = _settings.value.defaultEngine,
           clockPeriodNs = 2.5,
           hasUnsavedChanges = true,
-          isOfflineMode = isOfflineMode,
         )
       ).also(::persistDraft)
     }
@@ -1029,56 +1127,93 @@ endmodule
   }
 
   fun loadSavedDesign(design: RtlDesign) {
-    val parsed = (VerilogHdlParser.parse(design.verilogCode) as? VerilogParseResult.Success)?.design
-    val sdc = SdcParser.generateDefaultSdc(
+    val parsed = (RtlProjectHelpers.parseLanguageAware(design.verilogCode, null) as? VerilogParseResult.Success)?.design
+    val lang = RtlLanguage.fromId(design.language)
+    val sdc = RtlProjectHelpers.findSdcContent(
+      files = design.files,
+      fallbackSdc = "",
       moduleName = design.name,
-      ports = parsed?.topModule?.ports.orEmpty(),
       clockPeriodNs = design.clockPeriodNs,
-    )
+    ).ifBlank {
+      SdcParser.generateDefaultSdc(
+        moduleName = design.name,
+        ports = parsed?.topModule?.ports.orEmpty(),
+        clockPeriodNs = design.clockPeriodNs,
+      )
+    }
+    val files = if (design.files.isNotEmpty()) {
+      design.files
+    } else {
+      RtlProjectHelpers.buildDefaultFiles(design.name, design.verilogCode, lang, sdc)
+    }
     _workbench.update {
       applyParseToState(
         WorkbenchUiState(
-          activeCloudDesignId = design.id,
-          activeCloudCreatedAt = design.createdAt,
+          activeDesignId = design.id,
           designName = design.name,
           description = design.description,
           verilogCode = design.verilogCode,
           sdcText = sdc,
+          files = files,
+          openTabIds = files.map { f -> f.id },
+          activeFileId = files.first().id,
+          primaryLanguage = lang,
           targetLibrary = TargetLibrary.fromId(design.targetLibrary),
           optimizationGoal = OptimizationGoal.fromId(design.optimizationGoal),
+          synthesisEngine = _settings.value.defaultEngine,
           clockPeriodNs = design.clockPeriodNs,
           hasUnsavedChanges = false,
-          isOfflineMode = isOfflineMode,
         )
-      ).also { persistDraft(it, markDirtyForAutoSave = false) }
+      ).also { updated -> persistDraft(updated, markDirty = false) }
     }
-    dirtyForCloudAutoSave = false
+    dirtyForAutoSave = false
     runSynthesis()
   }
+
+  // ==================== SYNTHESIS EXECUTION ====================
 
   fun runSynthesis() {
     val snapshot = _workbench.value
     viewModelScope.launch {
-      _workbench.update { it.copy(isSynthesizing = true) }
+      _workbench.update {
+        it.copy(
+          isSynthesizing = true,
+          synthesisProgress = 0.25f,
+          synthesisPhaseLabel = "Elaborating RTL & Parsing HDL...",
+        )
+      }
+      val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(snapshot.files, snapshot.verilogCode)
       val (parseResult, result, simResult) = withContext(Dispatchers.Default) {
-        val parsed = VerilogHdlParser.parse(snapshot.verilogCode, snapshot.selectedTopModule)
+        val parsed = RtlProjectHelpers.parseLanguageAware(combinedRtl, snapshot.selectedTopModule)
         val synth = RtlSynthesisEngine.synthesize(
-          verilogSource = snapshot.verilogCode,
+          verilogSource = combinedRtl,
           library = snapshot.targetLibrary,
           goal = snapshot.optimizationGoal,
           clockPeriodNs = snapshot.clockPeriodNs,
           topModuleName = snapshot.selectedTopModule,
           sdcText = snapshot.sdcText,
+          engineProfile = snapshot.synthesisEngine,
         )
+        val tbSource = snapshot.files.firstOrNull { it.language == RtlLanguage.TESTBENCH }?.content.orEmpty()
+        val tbOverrides = if (snapshot.customSimValues.isEmpty() && tbSource.isNotBlank()) {
+          RtlSimulator.parseTestbenchOverrides(tbSource, snapshot.simCycleCount)
+        } else {
+          snapshot.customSimValues
+        }
         val sim = (parsed as? VerilogParseResult.Success)?.design?.let { design ->
           RtlSimulator.simulate(
             design = design,
             cycleCount = snapshot.simCycleCount,
             patternOverrides = snapshot.stimulusPatterns,
-            customValueOverrides = snapshot.customSimValues,
+            customValueOverrides = tbOverrides,
           )
         }
         Triple(parsed, synth, sim)
+      }
+      val duration = (result as? SynthesisResult.Success)?.report?.synthesisDurationMs ?: 0L
+      val phaseSummary = when (result) {
+        is SynthesisResult.Success -> "Synthesis complete (${duration} ms)"
+        is SynthesisResult.Error -> "Syntax / Elaboration Error (Line ${result.line})"
       }
       _workbench.update { state ->
         val firstSelected = when (result) {
@@ -1089,6 +1224,9 @@ endmodule
           parsedDesign = (parseResult as? VerilogParseResult.Success)?.design,
           parseError = parseResult as? VerilogParseResult.Error,
           synthesisResult = result,
+          synthesisProgress = 1f,
+          synthesisPhaseLabel = phaseSummary,
+          lastRunDurationMs = duration,
           selectedNodeId = firstSelected,
           manualNodePositions = emptyMap(),
           isManualSchematic = false,
@@ -1096,14 +1234,25 @@ endmodule
           simulationResult = simResult ?: state.simulationResult,
         )
       }
+      val report = (result as? SynthesisResult.Success)?.report
+      if (report != null && localStore != null && !snapshot.activeDesignId.isNullOrBlank()) {
+        localStore.recordLocalRun(buildRunModel(snapshot.activeDesignId, snapshot.designName, report))
+      }
     }
   }
 
   // ==================== RTL SIMULATION ====================
 
-  fun runSimulation() {
+  fun runSimulation(useTestbenchFile: Boolean = false) {
     val snapshot = _workbench.value
     viewModelScope.launch {
+      val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(snapshot.files, snapshot.verilogCode)
+      val tbSource = snapshot.files.firstOrNull { it.language == RtlLanguage.TESTBENCH }?.content.orEmpty()
+      val overrides = if (useTestbenchFile && tbSource.isNotBlank()) {
+        RtlSimulator.parseTestbenchOverrides(tbSource, snapshot.simCycleCount)
+      } else {
+        snapshot.customSimValues
+      }
       val sim = withContext(Dispatchers.Default) {
         val manualReport = (snapshot.synthesisResult as? SynthesisResult.Success)?.report
         when {
@@ -1111,31 +1260,37 @@ endmodule
             report = manualReport,
             cycleCount = snapshot.simCycleCount,
             patternOverrides = snapshot.stimulusPatterns,
-            customValueOverrides = snapshot.customSimValues,
+            customValueOverrides = overrides,
           )
           snapshot.parsedDesign != null -> RtlSimulator.simulate(
             design = snapshot.parsedDesign,
             cycleCount = snapshot.simCycleCount,
             patternOverrides = snapshot.stimulusPatterns,
-            customValueOverrides = snapshot.customSimValues,
+            customValueOverrides = overrides,
           )
           else -> {
-            val parsed = VerilogHdlParser.parse(snapshot.verilogCode, snapshot.selectedTopModule)
+            val parsed = RtlProjectHelpers.parseLanguageAware(combinedRtl, snapshot.selectedTopModule)
             (parsed as? VerilogParseResult.Success)?.design?.let { design ->
               RtlSimulator.simulate(
                 design = design,
                 cycleCount = snapshot.simCycleCount,
                 patternOverrides = snapshot.stimulusPatterns,
-                customValueOverrides = snapshot.customSimValues,
+                customValueOverrides = overrides,
               )
             }
           }
         }
       }
       if (sim != null) {
-        _workbench.update { it.copy(simulationResult = sim) }
+        _workbench.update {
+          it.copy(
+            simulationResult = sim,
+            customSimValues = if (useTestbenchFile) overrides else it.customSimValues,
+            statusBanner = if (useTestbenchFile) "Applied testbench stimulus and simulated ${sim.cycleCount} cycles." else it.statusBanner,
+          )
+        }
       } else {
-        _workbench.update { it.copy(statusBanner = "Fix Verilog syntax errors before running RTL simulation.") }
+        _workbench.update { it.copy(statusBanner = "Fix HDL syntax errors before running RTL simulation.") }
       }
     }
   }
@@ -1163,29 +1318,38 @@ endmodule
     runSimulation()
   }
 
+  fun toggleWaveformSignal(signalName: String) {
+    _workbench.update { state ->
+      val allNames = state.simulationResult?.traces?.map { it.name }?.toSet().orEmpty()
+      val current = state.selectedWaveformSignals.ifEmpty { allNames }
+      val updated = if (signalName in current) current - signalName else current + signalName
+      state.copy(selectedWaveformSignals = updated.ifEmpty { allNames })
+    }
+  }
+
   fun resetSimulationStimulus() {
     _workbench.update {
       it.copy(
         stimulusPatterns = emptyMap(),
         customSimValues = emptyMap(),
+        selectedWaveformSignals = emptySet(),
         statusBanner = "Reset simulation stimulus to automatic testbench vectors.",
       )
     }
     runSimulation()
   }
 
-  // ==================== CLOUD & LOCAL PERSISTENCE ====================
+  // ==================== LOCAL WORKSPACE PERSISTENCE ====================
 
-  fun saveDesignToCloud() {
+  fun saveDesign() {
     val state = _workbench.value
     if (state.designName.isBlank() || state.verilogCode.isBlank()) {
-      _workbench.update { it.copy(statusBanner = "Module name and Verilog source cannot be empty.") }
+      _workbench.update { it.copy(statusBanner = "Project name and RTL source cannot be empty.") }
       return
     }
     val report = (state.synthesisResult as? SynthesisResult.Success)?.report
     val designPayload = RtlDesign(
-      id = state.activeCloudDesignId ?: "",
-      userId = currentUserId,
+      id = state.activeDesignId.orEmpty(),
       name = state.designName.trim(),
       description = state.description.trim(),
       verilogCode = state.verilogCode,
@@ -1196,186 +1360,102 @@ endmodule
       lastAreaUm2 = report?.totalAreaUm2 ?: 0.0,
       lastCellCount = (report?.cellCount ?: 0).toLong(),
       lastPowerMw = report?.totalPowerMw ?: 0.0,
-      createdAt = state.activeCloudCreatedAt,
+      language = state.primaryLanguage.name,
+      files = state.files,
     )
 
-    if (isOfflineMode || repository == null) {
-      val savedId = localStore?.upsertLocalDesign(designPayload) ?: ""
-      if (report != null) {
-        localStore?.recordLocalRun(buildRunModel(savedId, state.designName.trim(), report))
-      }
-      _workbench.update {
-        it.copy(
-          activeCloudDesignId = savedId.ifBlank { it.activeCloudDesignId },
-          activeCloudCreatedAt = it.activeCloudCreatedAt ?: Timestamp.now(),
-          hasUnsavedChanges = false,
-          statusBanner = "Saved '${state.designName}' locally on device.",
-        )
-      }
-      return
+    val savedId = localStore?.upsertLocalDesign(designPayload) ?: ""
+    if (report != null) {
+      localStore?.recordLocalRun(buildRunModel(savedId, state.designName.trim(), report))
     }
-
-    viewModelScope.launch {
-      _workbench.update { it.copy(isSaving = true) }
-      val existingId = state.activeCloudDesignId
-      val isCloudDoc = existingId != null && !existingId.startsWith("local_") && state.activeCloudCreatedAt != null
-      val saveOutcome = if (isCloudDoc) {
-        repository.updateDesign(designPayload).map { existingId!! }
-      } else {
-        repository.createDesign(designPayload.copy(id = ""))
-      }
-
-      saveOutcome.fold(
-        onSuccess = { savedId ->
-          if (report != null) {
-            repository.recordSynthesisRun(buildRunModel(savedId, state.designName.trim(), report))
-          }
-          _workbench.update {
-            it.copy(
-              activeCloudDesignId = savedId,
-              activeCloudCreatedAt = it.activeCloudCreatedAt ?: Timestamp.now(),
-              isSaving = false,
-              hasUnsavedChanges = false,
-              autoSaveStatus = AutoSaveStatus.SAVED,
-              lastAutoSavedLabel = formatClockTime(clockMillisProvider()),
-              statusBanner = "Saved '${state.designName}' & synthesis snapshot to cloud.",
-            )
-          }
-          lastAutoSavedSignature = _workbench.value.toSaveSignature()
-          dirtyForCloudAutoSave = false
-        },
-        onFailure = { err ->
-          _workbench.update {
-            it.copy(
-              isSaving = false,
-              statusBanner = "Cloud save failed: ${err.localizedMessage ?: "Unknown error"}",
-            )
-          }
-        },
-      )
+    val savedTime = formatClockTime(clockMillisProvider())
+    _workbench.update {
+      it.copy(
+        activeDesignId = savedId.ifBlank { it.activeDesignId },
+        hasUnsavedChanges = false,
+        autoSaveStatus = AutoSaveStatus.SAVED,
+        lastAutoSavedLabel = savedTime,
+        statusBanner = "Saved project '${state.designName}' on device.",
+      ).also { updated -> persistDraft(updated, markDirty = false) }
     }
+    lastAutoSavedSignature = _workbench.value.toSaveSignature()
+    dirtyForAutoSave = false
+  }
+
+  fun duplicateDesign(design: RtlDesign) {
+    val copyPayload = design.copy(
+      id = "",
+      name = "${design.name}_copy",
+      createdAtMillis = 0L,
+      updatedAtMillis = 0L,
+    )
+    localStore?.upsertLocalDesign(copyPayload)
+    _workbench.update { it.copy(statusBanner = "Duplicated '${design.name}' as '${copyPayload.name}'.") }
   }
 
   fun saveRunSnapshotOnly() {
     val state = _workbench.value
     val report = (state.synthesisResult as? SynthesisResult.Success)?.report ?: run {
-      _workbench.update { it.copy(statusBanner = "Run a valid synthesis before saving a PPA snapshot.") }
+      _workbench.update { it.copy(statusBanner = "Run a valid synthesis before saving a report snapshot.") }
       return
     }
     val runPayload = buildRunModel(
-      designId = state.activeCloudDesignId ?: "preset_${state.designName}",
+      designId = state.activeDesignId ?: "preset_${state.designName}",
       designName = state.designName.trim().ifBlank { report.moduleName },
       report = report,
     )
-
-    if (isOfflineMode || repository == null) {
-      localStore?.recordLocalRun(runPayload)
-      _workbench.update {
-        it.copy(statusBanner = "Saved PPA snapshot locally (${report.targetLibrary.shortName}).")
-      }
-      return
-    }
-
-    viewModelScope.launch {
-      _workbench.update { it.copy(isSaving = true) }
-      val outcome = repository.recordSynthesisRun(runPayload)
-      outcome.fold(
-        onSuccess = {
-          _workbench.update {
-            it.copy(
-              isSaving = false,
-              statusBanner = "Recorded PPA snapshot (${report.targetLibrary.shortName}).",
-            )
-          }
-        },
-        onFailure = { err ->
-          _workbench.update {
-            it.copy(
-              isSaving = false,
-              statusBanner = "Snapshot failed: ${err.localizedMessage ?: "Unknown error"}",
-            )
-          }
-        },
-      )
+    localStore?.recordLocalRun(runPayload)
+    _workbench.update {
+      it.copy(statusBanner = "Saved engineering report snapshot (${report.targetLibrary.shortName}).")
     }
   }
 
-  fun syncLocalDesignsToCloud() {
-    if (isOfflineMode || repository == null || localStore == null) return
-    val pending = localStore.localDesigns.value
-    if (pending.isEmpty()) return
-    viewModelScope.launch {
-      _workbench.update { it.copy(isSaving = true) }
-      var synced = 0
-      pending.forEach { design ->
-        repository.createDesign(design.copy(id = "", userId = currentUserId, createdAt = null, updatedAt = null))
-          .onSuccess {
-            localStore.deleteLocalDesign(design.id)
-            synced++
-          }
-      }
-      _workbench.update {
-        it.copy(
-          isSaving = false,
-          statusBanner = if (synced > 0) "Synced $synced local module(s) to cloud." else "No local modules could be synced.",
-        )
-      }
-    }
-  }
-
-  fun deleteCloudDesign(designId: String) {
-    if (isOfflineMode || repository == null || designId.startsWith("local_")) {
-      localStore?.deleteLocalDesign(designId)
-      _workbench.update { state ->
-        val clearActive = state.activeCloudDesignId == designId
-        state.copy(
-          activeCloudDesignId = if (clearActive) null else state.activeCloudDesignId,
-          activeCloudCreatedAt = if (clearActive) null else state.activeCloudCreatedAt,
-          statusBanner = "Removed design from local workspace.",
-        )
-      }
-      return
-    }
-    viewModelScope.launch {
-      repository.deleteDesign(designId).fold(
-        onSuccess = {
-          _workbench.update { state ->
-            val clearActive = state.activeCloudDesignId == designId
-            state.copy(
-              activeCloudDesignId = if (clearActive) null else state.activeCloudDesignId,
-              activeCloudCreatedAt = if (clearActive) null else state.activeCloudCreatedAt,
-              statusBanner = "Deleted design from cloud workspace.",
-            )
-          }
-        },
-        onFailure = { err ->
-          _workbench.update { it.copy(statusBanner = "Delete failed: ${err.localizedMessage}") }
-        },
+  fun deleteSavedDesign(designId: String) {
+    localStore?.deleteLocalDesign(designId)
+    _workbench.update { state ->
+      val clearActive = state.activeDesignId == designId
+      state.copy(
+        activeDesignId = if (clearActive) null else state.activeDesignId,
+        statusBanner = "Removed project from device storage.",
       )
     }
   }
 
   fun deleteSynthesisRun(runId: String) {
-    if (isOfflineMode || repository == null || runId.startsWith("run_")) {
-      localStore?.deleteLocalRun(runId)
-      _workbench.update { it.copy(statusBanner = "Removed local synthesis snapshot.") }
-      return
-    }
-    viewModelScope.launch {
-      repository.deleteSynthesisRun(runId).fold(
-        onSuccess = {
-          _workbench.update { it.copy(statusBanner = "Removed synthesis run snapshot.") }
-        },
-        onFailure = { err ->
-          _workbench.update { it.copy(statusBanner = "Remove failed: ${err.localizedMessage}") }
-        },
-      )
-    }
+    localStore?.deleteLocalRun(runId)
+    _workbench.update { it.copy(statusBanner = "Removed synthesis report snapshot.") }
+  }
+
+  // ==================== IDE SETTINGS & STORAGE ====================
+
+  fun updateSettings(transform: (AppSettings) -> AppSettings) {
+    val next = transform(_settings.value)
+    _settings.value = next
+    localStore?.saveSettings(next)
+  }
+
+  fun toggleDarkTheme() {
+    updateSettings { it.copy(darkTheme = !it.darkTheme) }
+  }
+
+  fun clearSynthesisHistory() {
+    localStore?.clearSynthesisRuns()
+    _workbench.update { it.copy(statusBanner = "Cleared cached synthesis run reports.") }
+  }
+
+  fun resetWorkspaceToStarter() {
+    localStore?.clearActiveDraft()
+    loadPreset(PresetRtlDesigns.templates.first())
+    _workbench.update { it.copy(statusBanner = "Restored starter RTL project.") }
+  }
+
+  fun estimatedStorageKb(): Double {
+    val bytes = localStore?.estimatedStorageBytes() ?: 0L
+    return (bytes / 1024.0).coerceAtLeast(0.1)
   }
 
   private fun buildRunModel(designId: String, designName: String, report: SynthesisReport): SynthesisRun {
     return SynthesisRun(
-      userId = currentUserId,
       designId = designId,
       designName = designName,
       targetLibrary = report.targetLibrary.id,
@@ -1391,11 +1471,12 @@ endmodule
       powerMw = report.totalPowerMw,
       criticalPathSummary = report.criticalPathSummaryText(),
       netlistVerilog = report.netlistVerilog,
+      durationMs = report.synthesisDurationMs,
+      engineId = report.engineProfile.id,
     )
   }
 
   private companion object {
-    const val TAG = "RtlSynthVM"
     const val STOP_TIMEOUT_MILLIS = 5000L
     const val DEFAULT_AUTOSAVE_INTERVAL_MS = 15_000L
     const val DEFAULT_AUTOSAVE_DEBOUNCE_MS = 2_500L

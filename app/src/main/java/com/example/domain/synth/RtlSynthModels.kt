@@ -1,6 +1,7 @@
 package com.example.domain.synth
 
 import com.example.data.model.OptimizationGoal
+import com.example.data.model.SynthesisEngineProfile
 import com.example.data.model.TargetLibrary
 
 enum class PortDirection {
@@ -115,6 +116,10 @@ data class SynthesisReport(
   val outputDelayNs: Double = 0.0,
   val clockUncertaintyNs: Double = 0.0,
   val falsePathCount: Int = 0,
+  val synthesisDurationMs: Long = 0L,
+  val preOptCellCount: Int = 0,
+  val postOptCellCount: Int = 0,
+  val engineProfile: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
 ) {
   fun criticalPathSummaryText(): String {
     if (criticalPath.isEmpty()) return "No timing path (${"%.2f".format(criticalPathDelayNs)} ns)"
@@ -122,6 +127,13 @@ data class SynthesisReport(
     val suffix = if (criticalPath.size > 5) " -> ..." else ""
     return "$chain$suffix (${"%.2f".format(criticalPathDelayNs)} ns)"
   }
+
+  val optimizationReductionPercent: Double
+    get() = if (preOptCellCount > 0 && preOptCellCount >= postOptCellCount) {
+      ((preOptCellCount - postOptCellCount).toDouble() / preOptCellCount) * 100.0
+    } else {
+      0.0
+    }
 }
 
 sealed interface SynthesisResult {

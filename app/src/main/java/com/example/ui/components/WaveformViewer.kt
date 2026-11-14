@@ -53,6 +53,8 @@ fun WaveformViewer(
   selectedCycle: Int,
   onSelectCycle: (Int) -> Unit,
   modifier: Modifier = Modifier,
+  zoomScale: Float = 1f,
+  visibleSignals: Set<String> = emptySet(),
 ) {
   val scrollState = rememberScrollState()
   val textMeasurer = rememberTextMeasurer()
@@ -64,7 +66,13 @@ fun WaveformViewer(
   val onSurface = MaterialTheme.colorScheme.onSurface
   val onSurfaceVariant = MaterialTheme.colorScheme.onSurfaceVariant
 
-  val totalWaveformWidth = CYCLE_COL_WIDTH * simulation.cycleCount
+  val cycleColWidth = (CYCLE_COL_WIDTH.value * zoomScale.coerceIn(0.6f, 2.5f)).dp
+  val totalWaveformWidth = cycleColWidth * simulation.cycleCount
+  val filteredTraces = if (visibleSignals.isEmpty()) {
+    simulation.traces
+  } else {
+    simulation.traces.filter { it.name in visibleSignals }
+  }
 
   Surface(
     color = MaterialTheme.colorScheme.surface,
@@ -105,7 +113,7 @@ fun WaveformViewer(
             val isSel = c == selectedCycle
             Box(
               modifier = Modifier
-                .width(CYCLE_COL_WIDTH)
+                .width(cycleColWidth)
                 .background(if (isSel) primary.copy(alpha = 0.22f) else Color.Transparent)
                 .pointerInput(c) {
                   detectTapGestures { onSelectCycle(c) }
@@ -130,7 +138,7 @@ fun WaveformViewer(
       HorizontalDivider(color = outline.copy(alpha = 0.2f))
 
       // Signal Trace Rows
-      simulation.traces.forEachIndexed { idx, trace ->
+      filteredTraces.forEachIndexed { idx, trace ->
         val traceColor = when {
           trace.isClock -> secondary
           trace.direction == PortDirection.OUTPUT -> tertiary
@@ -257,7 +265,7 @@ fun WaveformViewer(
             }
           }
         }
-        if (idx < simulation.traces.lastIndex) {
+        if (idx < filteredTraces.lastIndex) {
           HorizontalDivider(color = outline.copy(alpha = 0.12f))
         }
       }
