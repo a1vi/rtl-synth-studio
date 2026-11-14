@@ -631,7 +631,10 @@ object RtlToGdsFlowEngine {
     utilizationPct: Int,
   ): FloorplanResult {
     val activeNodes = report.nodes.filterNot { it.gateType.isPort }
-    val rawArea = report.totalAreaUm2.coerceAtLeast(tech.rowHeightUm * tech.siteWidthUm * max(activeNodes.size, 4) * 4.0)
+    val minSlotAreaPerCell = tech.rowHeightUm * tech.siteWidthUm * 5.0
+    val minTotalActiveArea = activeNodes.size * minSlotAreaPerCell
+    val rawArea = max(report.totalAreaUm2 * 1.12, minTotalActiveArea)
+      .coerceAtLeast(tech.rowHeightUm * tech.siteWidthUm * max(activeNodes.size, 4) * 5.0)
     val targetCoreArea = rawArea / (utilizationPct.toDouble() / 100.0)
     val side = sqrt(targetCoreArea).coerceAtLeast(tech.rowHeightUm * 4.0)
     val rows = max(4, ceil(side / tech.rowHeightUm).toInt())

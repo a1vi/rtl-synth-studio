@@ -3,155 +3,17 @@ package com.example.domain.synth
 import kotlin.math.abs
 import kotlin.math.max
 
-enum class LogicSignalKind(val label: String) {
-  WIRE("wire"),
-  REG("reg"),
-  LOGIC("logic"),
-  INTEGER("integer"),
-}
-
-data class VerilogParameter(
-  val name: String,
-  val value: Int,
-  val isLocalparam: Boolean,
-  val line: Int,
-)
-
-data class VerilogLogicSignal(
-  val name: String,
-  val kind: LogicSignalKind,
-  val width: Int,
-  val msb: Int,
-  val lsb: Int,
-  val isSigned: Boolean,
-  val isPort: Boolean,
-  val line: Int,
-)
-
-data class VerilogAssignStmt(
-  val target: String,
-  val targetMsb: Int? = null,
-  val targetLsb: Int? = null,
-  val expr: VerilogExpr,
-  val line: Int,
-  val targetMsbExpr: VerilogExpr? = null,
-  val targetLsbExpr: VerilogExpr? = null,
-)
-
-data class VerilogAlwaysBlock(
-  val isSequential: Boolean,
-  val clockName: String?,
-  val resetName: String?,
-  val resetActiveLow: Boolean,
-  val sensitivitySignals: List<String>,
-  val statements: List<VerilogStmt>,
-  val line: Int,
-)
-
-data class VerilogModuleInstance(
-  val moduleType: String,
-  val instanceName: String,
-  val portConnections: Map<String, VerilogExpr>,
-  val positionalConnections: List<VerilogExpr>,
-  val line: Int,
-)
-
-sealed interface VerilogStmt {
-  data class Assign(
-    val target: String,
-    val expr: VerilogExpr,
-    val nonBlocking: Boolean,
-    val line: Int,
-    val targetMsb: Int? = null,
-    val targetLsb: Int? = null,
-    val targetMsbExpr: VerilogExpr? = null,
-    val targetLsbExpr: VerilogExpr? = null,
-  ) : VerilogStmt
-
-  data class IfStmt(
-    val cond: VerilogExpr,
-    val thenBranch: List<VerilogStmt>,
-    val elseBranch: List<VerilogStmt>,
-    val line: Int,
-  ) : VerilogStmt
-
-  data class CaseStmt(
-    val selector: VerilogExpr,
-    val branches: List<Pair<List<VerilogExpr>, List<VerilogStmt>>>,
-    val defaultBranch: List<VerilogStmt>,
-    val line: Int,
-  ) : VerilogStmt
-}
-
-sealed interface VerilogExpr {
-  data class Const(val value: Int, val width: Int = 1) : VerilogExpr
-  data class Signal(val name: String) : VerilogExpr
-  data class Slice(
-    val name: String,
-    val msb: Int,
-    val lsb: Int,
-    val msbExpr: VerilogExpr? = null,
-    val lsbExpr: VerilogExpr? = null,
-  ) : VerilogExpr
-  data class Concat(val parts: List<VerilogExpr>) : VerilogExpr
-  data class Replication(val count: Int, val inner: VerilogExpr) : VerilogExpr
-  data class Unary(val op: String, val inner: VerilogExpr) : VerilogExpr
-  data class Binary(val op: String, val left: VerilogExpr, val right: VerilogExpr) : VerilogExpr
-  data class Ternary(val cond: VerilogExpr, val thenExpr: VerilogExpr, val elseExpr: VerilogExpr) : VerilogExpr
-}
-
-data class ParsedVerilogModule(
-  val name: String,
-  val line: Int,
-  val parameters: List<VerilogParameter>,
-  val ports: List<RtlPort>,
-  val logicSignals: List<VerilogLogicSignal>,
-  val assignments: List<VerilogAssignStmt>,
-  val alwaysBlocks: List<VerilogAlwaysBlock>,
-  val instances: List<VerilogModuleInstance>,
-) {
-  val inputPorts: List<RtlPort>
-    get() = ports.filter { it.direction == PortDirection.INPUT }
-
-  val outputPorts: List<RtlPort>
-    get() = ports.filter { it.direction == PortDirection.OUTPUT }
-
-  val inoutPorts: List<RtlPort>
-    get() = ports.filter { it.direction == PortDirection.INOUT }
-
-  val internalSignals: List<VerilogLogicSignal>
-    get() = logicSignals.filter { !it.isPort }
-
-  fun signalWidth(name: String): Int =
-    logicSignals.firstOrNull { it.name == name }?.width
-      ?: ports.firstOrNull { it.name == name }?.width
-      ?: 1
-}
-
-data class ParsedVerilogDesign(
-  val modules: List<ParsedVerilogModule>,
-  val topModule: ParsedVerilogModule,
-  val diagnostics: List<String>,
-)
-
-sealed interface VerilogParseResult {
-  data class Success(val design: ParsedVerilogDesign) : VerilogParseResult
-  data class Error(
-    val line: Int,
-    val column: Int,
-    val message: String,
-    val partialModules: List<ParsedVerilogModule> = emptyList(),
-  ) : VerilogParseResult
-}
-
 /**
- * Standalone Verilog HDL Lexer & Recursive-Descent Parser.
+ * Full-featured Verilog-2001 & SystemVerilog HDL Lexer & Recursive-Descent Parser.
  *
- * Identifies:
- * - Single or multiple `module ... endmodule` declarations and selects the top-level module
- * - ANSI-style and Verilog-1995 `input`, `output`, and `inout` ports with vector `[msb:lsb]` ranges & `signed` flags
- * - Logic signals (`wire`, `reg`, `logic`, `integer`, `parameter`, `localparam`)
- * - Continuous `assign` statements, combinational/sequential `always` blocks, and submodule instantiations
+ * Supports:
+ * - Multi-module hierarchies, packages, interfaces/modports, enums, typedefs, and imports
+ * - Typed/ranged ANSI & Verilog-1995 parameters, `$clog2`, `$signed`, `$unsigned`, `$bits`
+ * - Yosys/Synopsys attributes `(* ... *)`, wire inline assigns (`wire a = b & c;`)
+ * - Concatenation LHS (`{cout, sum} = a + b;`), `+:`/`-:` indexed part-selects, 2D arrays
+ * - Combinational user `function`s, `always_ff`/`always_comb`/`always_latch`, `unique`/`priority case`
+ * - Built-in gate primitives (`and`, `or`, `nand`, `nor`, `xor`, `xnor`, `buf`, `not`), `.*`/`.name` ports
+ * - `generate`/`genvar` loops & `if`/`case` conditionals
  */
 object VerilogHdlParser {
 
@@ -172,13 +34,33 @@ object VerilogHdlParser {
     message: String,
   ) : Exception(message)
 
+  private data class VerilogFuncDef(
+    val paramNames: List<String>,
+    val bodyExpr: VerilogExpr,
+  )
+
   private val verilogKeywords = setOf(
-    "module", "endmodule", "input", "output", "inout", "wire", "reg", "logic",
-    "integer", "signed", "unsigned", "parameter", "localparam", "assign",
-    "always", "always_comb", "always_ff", "always_latch", "initial",
-    "begin", "end", "if", "else", "case", "casez", "casex", "default",
-    "endcase", "posedge", "negedge", "or", "for", "generate", "endgenerate",
-    "genvar", "function", "endfunction", "task", "endtask",
+    "module", "macromodule", "endmodule", "input", "output", "inout", "ref",
+    "wire", "reg", "logic", "bit", "byte", "shortint", "int", "longint", "integer",
+    "tri", "supply0", "supply1", "var", "signed", "unsigned", "parameter", "localparam",
+    "type", "assign", "always", "always_comb", "always_ff", "always_latch", "initial",
+    "begin", "end", "if", "else", "case", "casez", "casex", "default", "endcase",
+    "unique", "unique0", "priority", "posedge", "negedge", "or", "for", "while",
+    "repeat", "forever", "generate", "endgenerate", "genvar", "function", "endfunction",
+    "task", "endtask", "package", "endpackage", "interface", "endinterface",
+    "import", "export", "typedef", "struct", "union", "enum", "packed", "return",
+    "disable", "defparam", "specify", "endspecify", "property", "endproperty",
+    "sequence", "endsequence", "assert", "assume", "cover", "bind",
+  )
+
+  private val gatePrimitives = setOf(
+    "and", "nand", "or", "nor", "xor", "xnor", "buf", "not", "bufif0", "bufif1", "notif0", "notif1",
+  )
+
+  private val svTypeKeywords = setOf(
+    "wire", "reg", "logic", "bit", "byte", "shortint", "int", "longint", "integer",
+    "tri", "supply0", "supply1", "var", "real", "realtime", "time", "string",
+    "signed", "unsigned", "const", "automatic", "static",
   )
 
   fun parse(source: String, preferredTopModule: String? = null): VerilogParseResult {
@@ -236,6 +118,7 @@ object VerilogHdlParser {
 
   private fun analyzeDiagnostics(modules: List<ParsedVerilogModule>): List<String> {
     val warnings = mutableListOf<String>()
+    val modByName = modules.associateBy { it.name }
     modules.forEach { mod ->
       if (mod.ports.none { it.direction == PortDirection.OUTPUT }) {
         warnings += "Module '${mod.name}' declares no output ports."
@@ -244,8 +127,18 @@ object VerilogHdlParser {
       mod.assignments.forEach { drivenTargets += it.target }
       mod.alwaysBlocks.forEach { collectAssignedNames(it.statements, drivenTargets) }
       mod.instances.forEach { inst ->
-        inst.portConnections.values.forEach { expr ->
-          if (expr is VerilogExpr.Signal) drivenTargets += expr.name
+        val subMod = modByName[inst.moduleType]
+        inst.portConnections.forEach { (portName, expr) ->
+          val dir = subMod?.ports?.firstOrNull { it.name == portName }?.direction
+          if (dir == null || dir != PortDirection.INPUT) {
+            collectLhsTargetNames(expr, drivenTargets)
+          }
+        }
+        inst.positionalConnections.forEachIndexed { idx, expr ->
+          val dir = subMod?.ports?.getOrNull(idx)?.direction
+          if (dir != PortDirection.INPUT) {
+            collectLhsTargetNames(expr, drivenTargets)
+          }
         }
       }
       mod.outputPorts.forEach { outPort ->
@@ -255,6 +148,16 @@ object VerilogHdlParser {
       }
     }
     return warnings
+  }
+
+  private fun collectLhsTargetNames(expr: VerilogExpr, out: MutableSet<String>) {
+    when (expr) {
+      is VerilogExpr.Signal -> out += expr.name
+      is VerilogExpr.Slice -> out += expr.name
+      is VerilogExpr.Index -> collectLhsTargetNames(expr.base, out)
+      is VerilogExpr.Concat -> expr.parts.forEach { collectLhsTargetNames(it, out) }
+      else -> Unit
+    }
   }
 
   private fun collectAssignedNames(stmts: List<VerilogStmt>, out: MutableSet<String>) {
@@ -279,11 +182,17 @@ object VerilogHdlParser {
     var line = 1
     var col = 1
     val n = source.length
-    val twoCharOps = setOf("<=", ">=", "==", "!=", "&&", "||", "<<", ">>", "~&", "~|", "~^", "^~", "++", "--")
+    val threeCharOps = setOf("===", "!==", "==?", "!=?", "<<<", ">>>")
+    val twoCharOps = setOf(
+      "<=", ">=", "==", "!=", "&&", "||", "<<", ">>",
+      "~&", "~|", "~^", "^~", "++", "--", "**", "+:", "-:",
+      "+=", "-=", "&=", "|=", "^=", "::", "->", ".*",
+    )
 
     while (i < n) {
       val c = source[i]
       when {
+        c == '\r' -> i++
         c == '\n' -> {
           line++
           col = 1
@@ -294,9 +203,7 @@ object VerilogHdlParser {
           col++
         }
         c == '/' && i + 1 < n && source[i + 1] == '/' -> {
-          while (i < n && source[i] != '\n') {
-            i++
-          }
+          while (i < n && source[i] != '\n') i++
         }
         c == '/' && i + 1 < n && source[i + 1] == '*' -> {
           val startLine = line
@@ -323,6 +230,26 @@ object VerilogHdlParser {
             throw ParseException(startLine, startCol, "Unterminated block comment '/* ... */'")
           }
         }
+        // Verilog/Yosys attributes: (* keep = "true", ram_style = "block" *) — never match @(*) or (*)
+        c == '(' && i + 1 < n && source[i + 1] == '*' &&
+          tokens.lastOrNull()?.text != "@" && !(i + 2 < n && source[i + 2] == ')') -> {
+          i += 2
+          col += 2
+          while (i + 1 < n) {
+            if (source[i] == '*' && source[i + 1] == ')') {
+              i += 2
+              col += 2
+              break
+            }
+            if (source[i] == '\n') {
+              line++
+              col = 1
+            } else {
+              col++
+            }
+            i++
+          }
+        }
         c == '`' -> {
           while (i < n && source[i] != '\n') i++
         }
@@ -332,6 +259,11 @@ object VerilogHdlParser {
           val start = i++
           col++
           while (i < n && source[i] != '"') {
+            if (source[i] == '\\' && i + 1 < n) {
+              i += 2
+              col += 2
+              continue
+            }
             if (source[i] == '\n') {
               line++
               col = 1
@@ -347,23 +279,76 @@ object VerilogHdlParser {
           col++
           tokens += Token(TokenType.STRING, source.substring(start, i), startLine, startCol)
         }
-        c.isLetter() || c == '_' -> {
+        // Escaped Verilog identifiers (\foo[0] )
+        c == '\\' -> {
+          val startCol = col
+          i++
+          col++
+          val start = i
+          while (i < n && !source[i].isWhitespace()) {
+            i++
+            col++
+          }
+          val escName = source.substring(start, i).ifEmpty { "_esc" }
+          tokens += Token(TokenType.IDENT, escName, line, startCol)
+        }
+        // Identifiers & system functions ($clog2, $signed, ...)
+        c.isLetter() || c == '_' || (c == '$' && i + 1 < n && (source[i + 1].isLetter() || source[i + 1] == '_')) -> {
           val start = i
           val startCol = col
-          while (i < n && (source[i].isLetterOrDigit() || source[i] == '_')) {
+          i++
+          col++
+          while (i < n && (source[i].isLetterOrDigit() || source[i] == '_' || source[i] == '$')) {
             i++
             col++
           }
           tokens += Token(TokenType.IDENT, source.substring(start, i), line, startCol)
         }
-        c.isDigit() || (c == '\'' && i + 1 < n && source[i + 1] in listOf('b', 'B', 'h', 'H', 'd', 'D', 'o', 'O')) -> {
+        // Numbers, SystemVerilog fill literals ('0, '1, 'x, 'z), based numbers ('hFF), and casts (8')
+        c.isDigit() || (c == '\'' && i + 1 < n && source[i + 1] in listOf(
+          'b', 'B', 'h', 'H', 'd', 'D', 'o', 'O', 's', 'S', '0', '1', 'x', 'X', 'z', 'Z', '(',
+        )) -> {
           val start = i
           val startCol = col
-          while (i < n && (source[i].isLetterOrDigit() || source[i] == '\'' || source[i] == '_')) {
+          if (c == '\'') {
             i++
             col++
+            while (i < n && (source[i].isLetterOrDigit() || source[i] == '_')) {
+              i++
+              col++
+            }
+          } else {
+            while (i < n && (source[i].isDigit() || source[i] == '_')) {
+              i++
+              col++
+            }
+            if (i < n && source[i] == '.' && i + 1 < n && source[i + 1].isDigit()) {
+              i++
+              col++
+              while (i < n && (source[i].isDigit() || source[i] == '_')) {
+                i++
+                col++
+              }
+            }
+            // Optional single spaces between width and radix quote e.g. 32 'hFF
+            var peekQuote = i
+            while (peekQuote < n && (source[peekQuote] == ' ' || source[peekQuote] == '\t')) peekQuote++
+            if (peekQuote < n && source[peekQuote] == '\'') {
+              col += (peekQuote - i) + 1
+              i = peekQuote + 1
+              while (i < n && (source[i].isLetterOrDigit() || source[i] == '_')) {
+                i++
+                col++
+              }
+            }
           }
-          tokens += Token(TokenType.NUMBER, source.substring(start, i), line, startCol)
+          val text = source.substring(start, i).replace(" ", "").replace("\t", "")
+          tokens += Token(TokenType.NUMBER, text, line, startCol)
+        }
+        i + 2 < n && source.substring(i, i + 3) in threeCharOps -> {
+          tokens += Token(TokenType.SYMBOL, source.substring(i, i + 3), line, col)
+          i += 3
+          col += 3
         }
         i + 1 < n && source.substring(i, i + 2) in twoCharOps -> {
           tokens += Token(TokenType.SYMBOL, source.substring(i, i + 2), line, col)
@@ -383,6 +368,10 @@ object VerilogHdlParser {
 
   private class Parser(private val tokens: List<Token>) {
     private var pos = 0
+    private val globalPackageConsts = linkedMapOf<String, Int>()
+    private val globalFunctions = linkedMapOf<String, VerilogFuncDef>()
+    private val moduleFunctions = linkedMapOf<String, VerilogFuncDef>()
+    private val signalWidths = linkedMapOf<String, Int>()
 
     private fun peek(offset: Int = 0): Token =
       tokens[(pos + offset).coerceAtMost(tokens.lastIndex)]
@@ -418,18 +407,66 @@ object VerilogHdlParser {
     }
 
     fun hasMoreModules(): Boolean {
-      while (peek().type != TokenType.EOF && peek().text != "module") {
-        pos++
+      while (peek().type != TokenType.EOF) {
+        when (peek().text) {
+          "module", "macromodule" -> return true
+          "package" -> parsePackageBlock()
+          "interface" -> skipUntilKeyword("endinterface")
+          "typedef" -> {
+            val dummySignals = linkedMapOf<String, VerilogLogicSignal>()
+            parseTypedefOrEnum(globalPackageConsts, dummySignals)
+          }
+          "import" -> skipUntilSemicolon()
+          else -> pos++
+        }
       }
-      return peek().text == "module"
+      return false
+    }
+
+    private fun parsePackageBlock() {
+      consume() // package
+      if (peek().type == TokenType.IDENT) consume()
+      match(";")
+      val params = mutableListOf<VerilogParameter>()
+      val dummySignals = linkedMapOf<String, VerilogLogicSignal>()
+      while (peek().type != TokenType.EOF && peek().text != "endpackage") {
+        when (peek().text) {
+          "parameter", "localparam" -> {
+            val isLocal = consume().text == "localparam"
+            parseParamDecls(params, globalPackageConsts, isLocal)
+            match(";")
+          }
+          "typedef", "enum" -> parseTypedefOrEnum(globalPackageConsts, dummySignals)
+          "function" -> parseFunctionDecl(globalPackageConsts, globalFunctions)
+          else -> consume()
+        }
+      }
+      if (match("endpackage")) {
+        if (match(":")) expectIdentIfPresent()
+      }
+    }
+
+    private fun expectIdentIfPresent() {
+      if (peek().type == TokenType.IDENT) consume()
     }
 
     fun parseModule(): ParsedVerilogModule {
-      val modTok = expect("module")
+      val modTok = consume() // module / macromodule
       val moduleName = expectIdent().text
 
+      moduleFunctions.clear()
+      moduleFunctions.putAll(globalFunctions)
+      signalWidths.clear()
+
       val parameters = mutableListOf<VerilogParameter>()
-      val paramMap = mutableMapOf<String, Int>()
+      val paramMap = globalPackageConsts.toMutableMap()
+
+      // Optional header imports: module foo import pkg::*; #(parameter ...) (...);
+      while (match("import")) {
+        while (peek().text != ";" && peek().type != TokenType.EOF) consume()
+        match(";")
+      }
+
       if (match("#")) {
         expect("(")
         while (peek().text != ")" && peek().type != TokenType.EOF) {
@@ -449,6 +486,8 @@ object VerilogHdlParser {
         expect(")")
       }
       expect(";")
+
+      ports.forEach { signalWidths[it.name] = it.width }
 
       val assigns = mutableListOf<VerilogAssignStmt>()
       val alwaysBlocks = mutableListOf<VerilogAlwaysBlock>()
@@ -477,6 +516,7 @@ object VerilogHdlParser {
         )
       }
       expect("endmodule")
+      if (match(":")) expectIdentIfPresent()
 
       // Ensure every port also appears in logicSignals list
       ports.forEach { port ->
@@ -507,30 +547,84 @@ object VerilogHdlParser {
       )
     }
 
+    private fun skipOptionalTypeAndRanges(params: Map<String, Int>): Triple<Int, Int, Int>? {
+      var customRange: Triple<Int, Int, Int>? = null
+      // Consume leading SV type / signed qualifiers
+      while (peek().text in svTypeKeywords || peek().text == "type") {
+        if (peek().text == "integer" || peek().text == "int") {
+          customRange = Triple(32, 31, 0)
+        }
+        consume()
+      }
+      // Consume scoped type pkg::type_t or custom type if another IDENT precedes '=' or name
+      if (peek().type == TokenType.IDENT && peek(1).text == "::") {
+        consume(); consume() // pkg ::
+        if (peek().type == TokenType.IDENT && peek(1).type == TokenType.IDENT) consume()
+      } else if (peek().type == TokenType.IDENT && peek().text !in verilogKeywords &&
+        (peek(1).type == TokenType.IDENT || peek(1).text == "[")
+      ) {
+        // Check carefully: don't eat parameter/port identifier when peek(1) is '=' or ',' or ')' or ';'
+        val p1 = peek(1).text
+        if (p1 != "=" && p1 != "," && p1 != ")" && p1 != ";" && peek(1).type == TokenType.IDENT) {
+          consume()
+        }
+      }
+      if (peek().text == "[") {
+        customRange = parseMultiPackedRanges(params)
+      }
+      return customRange
+    }
+
     private fun parseParamDecls(
       params: MutableList<VerilogParameter>,
       paramMap: MutableMap<String, Int>,
       isLocal: Boolean,
     ) {
       while (peek().type != TokenType.EOF && peek().text != ";" && peek().text != ")") {
+        if (peek().text == "parameter" || peek().text == "localparam") break
+        val isTypeParam = match("type")
+        skipOptionalTypeAndRanges(paramMap)
         if (peek().type == TokenType.IDENT) {
           val tok = consume()
+          // Skip optional unpacked dims on parameter arrays e.g. parameter int LUT [0:3] = ...
+          while (peek().text == "[") skipBracketGroup()
           if (match("=")) {
-            val value = evalConstInt(parseExpr(paramMap), paramMap)
-            paramMap[tok.text] = value
-            params += VerilogParameter(tok.text, value, isLocal, tok.line)
+            if (isTypeParam || peek().text in svTypeKeywords) {
+              skipBalancedUntil(setOf(",", ")"))
+            } else if (peek().text == "'{" || (peek().text == "{" && looksLikeArrayLiteral())) {
+              skipBalancedUntil(setOf(",", ")"))
+            } else {
+              val value = evalConstInt(parseExpr(paramMap), paramMap)
+              paramMap[tok.text] = value
+              params += VerilogParameter(tok.text, value, isLocal, tok.line)
+            }
+          } else {
+            params += VerilogParameter(tok.text, paramMap[tok.text] ?: 0, isLocal, tok.line)
           }
         } else {
           consume()
         }
         if (peek().text == ",") {
-          // Stop if next token starts a new parameter keyword inside #( ... )
           if (peek(1).text == "parameter" || peek(1).text == "localparam") break
           consume()
         } else {
           break
         }
       }
+    }
+
+    private fun looksLikeArrayLiteral(): Boolean {
+      var offset = 1
+      var depth = 1
+      while (depth > 0 && peek(offset).type != TokenType.EOF) {
+        when (peek(offset).text) {
+          "{" -> depth++
+          "}" -> depth--
+          "default" -> if (peek(offset + 1).text == ":") return true
+        }
+        offset++
+      }
+      return false
     }
 
     private fun parsePortList(
@@ -541,61 +635,75 @@ object VerilogHdlParser {
       var lastDir: PortDirection? = null
       var lastKind = LogicSignalKind.WIRE
       var lastSigned = false
-      var lastRange = Triple(1, 0, 0) // width, msb, lsb
+      var lastRange = Triple(1, 0, 0)
 
       while (peek().text != ")" && peek().type != TokenType.EOF) {
+        if (match(".*")) {
+          if (!match(",")) break
+          continue
+        }
         val dir = when (peek().text) {
           "input" -> { consume(); PortDirection.INPUT }
           "output" -> { consume(); PortDirection.OUTPUT }
-          "inout" -> { consume(); PortDirection.INOUT }
+          "inout", "ref" -> { consume(); PortDirection.INOUT }
           else -> null
         }
 
+        val activeDir = dir ?: lastDir
         if (dir != null) {
           lastDir = dir
-          lastKind = when {
-            match("reg") -> LogicSignalKind.REG
-            match("logic") -> LogicSignalKind.LOGIC
-            else -> {
-              match("wire")
-              LogicSignalKind.WIRE
+          lastKind = LogicSignalKind.WIRE
+          lastSigned = false
+          lastRange = Triple(1, 0, 0)
+        }
+
+        if (activeDir != null) {
+          match("var")
+          when {
+            match("reg") -> lastKind = LogicSignalKind.REG
+            match("logic") -> lastKind = LogicSignalKind.LOGIC
+            match("integer") -> {
+              lastKind = LogicSignalKind.INTEGER
+              lastRange = Triple(32, 31, 0)
+            }
+            match("int") -> {
+              lastKind = LogicSignalKind.LOGIC
+              lastRange = Triple(32, 31, 0)
+            }
+            match("bit") -> lastKind = LogicSignalKind.LOGIC
+            match("wire") || match("tri") -> lastKind = LogicSignalKind.WIRE
+          }
+          if (match("signed")) lastSigned = true
+          else if (match("unsigned")) lastSigned = false
+
+          // Handle custom typedef / interface.modport / pkg::type_t before port name
+          if (peek().type == TokenType.IDENT && peek().text !in verilogKeywords) {
+            if (peek(1).text == "::") {
+              consume(); consume() // pkg ::
+              if (peek().type == TokenType.IDENT && peek(1).type == TokenType.IDENT) consume()
+            } else if (peek(1).text == "." && peek(2).type == TokenType.IDENT && peek(3).type == TokenType.IDENT) {
+              consume(); consume(); consume() // if_name . modport
+            } else if (peek(1).type == TokenType.IDENT) {
+              consume() // custom_type_t
             }
           }
-          lastSigned = match("signed")
-          lastRange = if (peek().text == "[") parseVectorRange(params) else Triple(1, 0, 0)
-          val nameTok = expectIdent()
-          val port = RtlPort(
-            name = nameTok.text,
-            direction = dir,
-            width = lastRange.first,
-            isReg = lastKind == LogicSignalKind.REG || lastKind == LogicSignalKind.LOGIC,
-            msb = lastRange.second,
-            lsb = lastRange.third,
-            isSigned = lastSigned,
-            line = nameTok.line,
-          )
-          ports += port
-          signals[port.name] = VerilogLogicSignal(
-            name = port.name,
-            kind = lastKind,
-            width = port.width,
-            msb = port.msb,
-            lsb = port.lsb,
-            isSigned = port.isSigned,
-            isPort = true,
-            line = port.line,
-          )
-        } else if (lastDir != null) {
-          if (match("reg")) lastKind = LogicSignalKind.REG
-          else if (match("logic")) lastKind = LogicSignalKind.LOGIC
-          else if (match("wire")) lastKind = LogicSignalKind.WIRE
-          if (match("signed")) lastSigned = true
-          if (peek().text == "[") lastRange = parseVectorRange(params)
+
+          if (peek().text == "[") {
+            lastRange = parseMultiPackedRanges(params)
+          }
 
           val nameTok = expectIdent()
+          while (peek().text == "[") {
+            // Unpacked port dims e.g. input [7:0] arr [0:3]
+            skipBracketGroup()
+          }
+          if (match("=")) {
+            // Optional SystemVerilog default input port expression
+            parseExpr(params)
+          }
           val port = RtlPort(
             name = nameTok.text,
-            direction = lastDir,
+            direction = activeDir,
             width = lastRange.first,
             isReg = lastKind == LogicSignalKind.REG || lastKind == LogicSignalKind.LOGIC,
             msb = lastRange.second,
@@ -604,6 +712,7 @@ object VerilogHdlParser {
             line = nameTok.line,
           )
           ports += port
+          signalWidths[port.name] = port.width
           signals[port.name] = VerilogLogicSignal(
             name = port.name,
             kind = lastKind,
@@ -615,9 +724,17 @@ object VerilogHdlParser {
             line = port.line,
           )
         } else {
-          // Verilog-1995 header: direction & width defined inside module body
+          // Interface port (`axi_if.master bus`) or Verilog-1995 header (`a, b, y`)
+          if (peek().type == TokenType.IDENT && peek(1).text == "." && peek(2).type == TokenType.IDENT) {
+            consume(); consume(); consume()
+          } else if (peek().type == TokenType.IDENT && peek(1).type == TokenType.IDENT) {
+            consume()
+          }
           val nameTok = expectIdent()
-          ports += RtlPort(nameTok.text, PortDirection.INPUT, 1, false, 0, 0, false, nameTok.line)
+          while (peek().text == "[") skipBracketGroup()
+          val port = RtlPort(nameTok.text, PortDirection.INPUT, 1, false, 0, 0, false, nameTok.line)
+          ports += port
+          signalWidths.putIfAbsent(port.name, 1)
         }
         if (!match(",")) break
       }
@@ -633,18 +750,25 @@ object VerilogHdlParser {
         "output" -> PortDirection.OUTPUT
         else -> PortDirection.INOUT
       }
+      match("var")
       val kind = when {
         match("reg") -> LogicSignalKind.REG
-        match("logic") -> LogicSignalKind.LOGIC
+        match("logic") || match("bit") -> LogicSignalKind.LOGIC
+        match("integer") -> LogicSignalKind.INTEGER
         else -> {
-          match("wire")
+          match("wire"); match("tri")
           LogicSignalKind.WIRE
         }
       }
-      val isSigned = match("signed")
-      val (width, msb, lsb) = if (peek().text == "[") parseVectorRange(params) else Triple(1, 0, 0)
+      val isSigned = match("signed").also { if (!it) match("unsigned") }
+      val (width, msb, lsb) = when {
+        kind == LogicSignalKind.INTEGER -> Triple(32, 31, 0)
+        peek().text == "[" -> parseMultiPackedRanges(params)
+        else -> Triple(1, 0, 0)
+      }
       while (peek().type != TokenType.EOF && peek().text != ";") {
         val nameTok = expectIdent()
+        while (peek().text == "[") skipBracketGroup()
         val updated = RtlPort(
           name = nameTok.text,
           direction = dir,
@@ -657,6 +781,7 @@ object VerilogHdlParser {
         )
         val existingIdx = ports.indexOfFirst { it.name == nameTok.text }
         if (existingIdx >= 0) ports[existingIdx] = updated else ports += updated
+        signalWidths[nameTok.text] = width
         signals[nameTok.text] = VerilogLogicSignal(
           name = nameTok.text,
           kind = kind,
@@ -667,48 +792,6 @@ object VerilogHdlParser {
           isPort = true,
           line = nameTok.line,
         )
-        if (!match(",")) break
-      }
-      expect(";")
-    }
-
-    private fun parseSignalDecl(
-      signals: MutableMap<String, VerilogLogicSignal>,
-      params: Map<String, Int>,
-    ) {
-      val kind = when (consume().text) {
-        "reg" -> LogicSignalKind.REG
-        "logic" -> LogicSignalKind.LOGIC
-        "integer" -> LogicSignalKind.INTEGER
-        else -> LogicSignalKind.WIRE
-      }
-      val isSigned = match("signed")
-      val (width, msb, lsb) = when {
-        kind == LogicSignalKind.INTEGER -> Triple(32, 31, 0)
-        peek().text == "[" -> parseVectorRange(params)
-        else -> Triple(1, 0, 0)
-      }
-      while (peek().type != TokenType.EOF && peek().text != ";") {
-        val nameTok = expectIdent()
-        // Optional unpacked array dimensions e.g. reg [7:0] mem [0:15];
-        if (peek().text == "[") {
-          while (peek().text == "[") {
-            consume()
-            while (peek().text != "]" && peek().type != TokenType.EOF) consume()
-            expect("]")
-          }
-        }
-        val existing = signals[nameTok.text]
-        signals[nameTok.text] = VerilogLogicSignal(
-          name = nameTok.text,
-          kind = kind,
-          width = if (existing?.isPort == true && width == 1) existing.width else width,
-          msb = if (existing?.isPort == true && width == 1) existing.msb else msb,
-          lsb = if (existing?.isPort == true && width == 1) existing.lsb else lsb,
-          isSigned = isSigned,
-          isPort = existing?.isPort ?: false,
-          line = nameTok.line,
-        )
         if (match("=")) {
           parseExpr(params)
         }
@@ -717,52 +800,446 @@ object VerilogHdlParser {
       expect(";")
     }
 
-    private fun parseAssignStmt(params: Map<String, Int>): VerilogAssignStmt {
+    private fun parseSignalDecl(
+      signals: MutableMap<String, VerilogLogicSignal>,
+      params: Map<String, Int>,
+      assigns: MutableList<VerilogAssignStmt>,
+    ) {
+      val kw = consume().text
+      val kind = when (kw) {
+        "reg" -> LogicSignalKind.REG
+        "logic", "bit", "byte", "shortint", "int", "longint" -> LogicSignalKind.LOGIC
+        "integer" -> LogicSignalKind.INTEGER
+        else -> LogicSignalKind.WIRE
+      }
+      val isSigned = match("signed").also { if (!it) match("unsigned") }
+      val (width, msb, lsb) = when {
+        kw == "integer" || kw == "int" -> Triple(32, 31, 0)
+        kw == "byte" -> Triple(8, 7, 0)
+        kw == "shortint" -> Triple(16, 15, 0)
+        kw == "longint" -> Triple(64, 63, 0)
+        peek().text == "[" -> parseMultiPackedRanges(params)
+        else -> Triple(1, 0, 0)
+      }
+      while (peek().type != TokenType.EOF && peek().text != ";") {
+        val nameTok = expectIdent()
+        // Optional unpacked array dimensions e.g. reg [31:0] mem [0:255]; or logic [7:0] mem [16];
+        while (peek().text == "[") {
+          skipBracketGroup()
+        }
+        val existing = signals[nameTok.text]
+        val finalW = if (existing?.isPort == true && width == 1) existing.width else width
+        val finalMsb = if (existing?.isPort == true && width == 1) existing.msb else msb
+        val finalLsb = if (existing?.isPort == true && width == 1) existing.lsb else lsb
+        signalWidths[nameTok.text] = finalW
+        signals[nameTok.text] = VerilogLogicSignal(
+          name = nameTok.text,
+          kind = kind,
+          width = finalW,
+          msb = finalMsb,
+          lsb = finalLsb,
+          isSigned = isSigned,
+          isPort = existing?.isPort ?: false,
+          line = nameTok.line,
+        )
+        if (match("=")) {
+          if (peek().text == "'{" || (peek().text == "{" && looksLikeArrayLiteral())) {
+            skipBalancedUntil(setOf(",", ";"))
+          } else {
+            val rhsExpr = parseExpr(params)
+            // Inline wire/logic continuous assignment: `wire [7:0] sum = a + b;`
+            if (kind == LogicSignalKind.WIRE || kind == LogicSignalKind.LOGIC) {
+              assigns += VerilogAssignStmt(
+                target = nameTok.text,
+                targetMsb = if (finalW > 1) finalMsb else null,
+                targetLsb = if (finalW > 1) finalLsb else null,
+                expr = rhsExpr,
+                line = nameTok.line,
+              )
+            }
+          }
+        }
+        if (!match(",")) break
+      }
+      expect(";")
+    }
+
+    private fun parseTypedefOrEnum(
+      paramMap: MutableMap<String, Int>,
+      signals: MutableMap<String, VerilogLogicSignal>,
+    ) {
+      val line = consume().line // typedef or enum
+      // If struct/union: `typedef struct packed { ... } pkt_t;`
+      while (peek().type != TokenType.EOF && peek().text != "{" && peek().text != ";") {
+        consume()
+      }
+      if (match("{")) {
+        // Parse enum items if looks like enum (comma-separated idents, no ';'), else skip struct body
+        val saved = pos
+        var isStruct = false
+        var depth = 1
+        while (depth > 0 && peek().type != TokenType.EOF) {
+          when (consume().text) {
+            "{" -> depth++
+            "}" -> depth--
+            ";" -> isStruct = true
+          }
+        }
+        if (!isStruct) {
+          pos = saved
+          var nextEnumVal = 0
+          while (peek().text != "}" && peek().type != TokenType.EOF) {
+            if (peek().type == TokenType.IDENT) {
+              val itemTok = consume()
+              if (match("=")) {
+                nextEnumVal = evalConstInt(parseExpr(paramMap), paramMap)
+              }
+              paramMap[itemTok.text] = nextEnumVal
+              nextEnumVal++
+            } else {
+              consume()
+            }
+            if (!match(",")) break
+          }
+          match("}")
+        }
+      }
+      // Trailing type/variable names: `} state_t;` or `} state, next_state;`
+      while (peek().type != TokenType.EOF && peek().text != ";") {
+        if (peek().type == TokenType.IDENT) {
+          val vTok = consume()
+          while (peek().text == "[") skipBracketGroup()
+          signals.putIfAbsent(
+            vTok.text,
+            VerilogLogicSignal(vTok.text, LogicSignalKind.LOGIC, 8, 7, 0, isSigned = false, isPort = false, line = line),
+          )
+          signalWidths.putIfAbsent(vTok.text, 8)
+        } else {
+          consume()
+        }
+        match(",")
+      }
+      match(";")
+    }
+
+    private fun parseFunctionDecl(
+      paramMap: Map<String, Int>,
+      targetFuncs: MutableMap<String, VerilogFuncDef>,
+    ) {
+      val startPos = pos
+      consume() // function
+      match("automatic")
+      // Skip optional return range/type
+      while (peek().text in svTypeKeywords || peek().text == "[" || (peek().type == TokenType.IDENT && peek(1).text != "(" && peek(1).text != ";")) {
+        if (peek().text == "[") skipBracketGroup() else consume()
+      }
+      val fnName = if (peek().type == TokenType.IDENT) consume().text else {
+        skipUntilKeyword("endfunction")
+        return
+      }
+      val argNames = mutableListOf<String>()
+      if (match("(")) {
+        while (peek().text != ")" && peek().type != TokenType.EOF) {
+          match("input"); match("output"); match("inout")
+          while (peek().text in svTypeKeywords || peek().text == "[") {
+            if (peek().text == "[") skipBracketGroup() else consume()
+          }
+          if (peek().type == TokenType.IDENT && peek(1).type == TokenType.IDENT) consume()
+          if (peek().type == TokenType.IDENT) {
+            argNames += consume().text
+            while (peek().text == "[") skipBracketGroup()
+            if (match("=")) parseExpr(paramMap)
+          } else {
+            consume()
+          }
+          if (!match(",")) break
+        }
+        match(")")
+      }
+      match(";")
+
+      // Try extracting combinational function body (Verilog-2001/SV)
+      val bodyStmts = mutableListOf<VerilogStmt>()
+      var canExtract = true
+      while (peek().text != "endfunction" && peek().type != TokenType.EOF) {
+        when (peek().text) {
+          "input" -> {
+            consume()
+            while (peek().text in svTypeKeywords || peek().text == "[") {
+              if (peek().text == "[") skipBracketGroup() else consume()
+            }
+            while (peek().type != TokenType.EOF && peek().text != ";") {
+              if (peek().type == TokenType.IDENT) argNames += consume().text else consume()
+              match(",")
+            }
+            match(";")
+          }
+          "output", "reg", "logic", "wire", "integer", "int", "localparam" -> {
+            skipUntilSemicolon()
+          }
+          "return" -> {
+            val l = consume().line
+            val e = parseExpr(paramMap)
+            match(";")
+            bodyStmts += VerilogStmt.Assign(fnName, e, nonBlocking = false, line = l)
+          }
+          else -> {
+            try {
+              bodyStmts += parseStmtOrBlock(paramMap)
+            } catch (_: ParseException) {
+              canExtract = false
+              break
+            }
+          }
+        }
+      }
+      if (canExtract && match("endfunction")) {
+        if (match(":")) expectIdentIfPresent()
+        val expr = extractReturnExpr(bodyStmts, fnName)
+        if (expr != null) {
+          targetFuncs[fnName] = VerilogFuncDef(argNames.distinct(), expr)
+        }
+      } else {
+        pos = startPos
+        skipUntilKeyword("endfunction")
+        if (match(":")) expectIdentIfPresent()
+      }
+    }
+
+    private fun extractReturnExpr(stmts: List<VerilogStmt>, fnName: String): VerilogExpr? {
+      var cur: VerilogExpr? = null
+      for (s in stmts) {
+        when (s) {
+          is VerilogStmt.Assign -> if (s.target == fnName || stmts.size == 1) cur = s.expr
+          is VerilogStmt.IfStmt -> {
+            val t = extractReturnExpr(s.thenBranch, fnName)
+            val e = extractReturnExpr(s.elseBranch, fnName) ?: cur ?: VerilogExpr.Const(0, 32)
+            if (t != null) cur = VerilogExpr.Ternary(s.cond, t, e)
+          }
+          is VerilogStmt.CaseStmt -> {
+            var acc = extractReturnExpr(s.defaultBranch, fnName) ?: cur ?: VerilogExpr.Const(0, 32)
+            for ((pats, body) in s.branches.asReversed()) {
+              val b = extractReturnExpr(body, fnName)
+              if (b != null && pats.isNotEmpty()) {
+                val cond = pats.map { p -> VerilogExpr.Binary("==", s.selector, p) as VerilogExpr }
+                  .reduce { a, x -> VerilogExpr.Binary("||", a, x) }
+                acc = VerilogExpr.Ternary(cond, b, acc)
+              }
+            }
+            cur = acc
+          }
+        }
+      }
+      return cur
+    }
+
+    private fun parseGatePrimitive(assigns: MutableList<VerilogAssignStmt>, params: Map<String, Int>) {
+      val gateTok = consume()
+      // Optional drive strength `(strong1, weak0)` or delay `#1` / `#(1, 2)`
+      skipOptionalDriveOrDelay()
+      // Optional instance name before `(out, in0, in1, ...)`
+      if (peek().type == TokenType.IDENT) {
+        consume()
+        while (peek().text == "[") skipBracketGroup()
+      }
+      expect("(")
+      val args = mutableListOf<VerilogExpr>()
+      while (peek().text != ")" && peek().type != TokenType.EOF) {
+        args += parseExpr(params)
+        if (!match(",")) break
+      }
+      expect(")")
+      expect(";")
+      if (args.size >= 2) {
+        val outTarget = extractBaseName(args.first()) ?: return
+        val ins = args.drop(1)
+        val combinedExpr: VerilogExpr = when (gateTok.text) {
+          "buf", "bufif0", "bufif1" -> ins.first()
+          "not", "notif0", "notif1" -> VerilogExpr.Unary("~", ins.first())
+          "and" -> ins.reduce { a, b -> VerilogExpr.Binary("&", a, b) }
+          "nand" -> VerilogExpr.Unary("~", ins.reduce { a, b -> VerilogExpr.Binary("&", a, b) })
+          "or" -> ins.reduce { a, b -> VerilogExpr.Binary("|", a, b) }
+          "nor" -> VerilogExpr.Unary("~", ins.reduce { a, b -> VerilogExpr.Binary("|", a, b) })
+          "xor" -> ins.reduce { a, b -> VerilogExpr.Binary("^", a, b) }
+          "xnor" -> VerilogExpr.Unary("~", ins.reduce { a, b -> VerilogExpr.Binary("^", a, b) })
+          else -> ins.first()
+        }
+        assigns += VerilogAssignStmt(outTarget, expr = combinedExpr, line = gateTok.line)
+      }
+    }
+
+    private fun skipOptionalDriveOrDelay() {
+      if (peek().text == "(") {
+        // Check if first token after '(' is a drive strength keyword rather than port list
+        val s1 = peek(1).text.lowercase()
+        if (s1 in setOf("supply0", "supply1", "strong0", "strong1", "pull0", "pull1", "weak0", "weak1", "highz0", "highz1")) {
+          skipParenGroup()
+        }
+      }
+      if (match("#")) {
+        if (peek().text == "(") skipParenGroup()
+        else if (peek().type == TokenType.NUMBER || peek().type == TokenType.IDENT) consume()
+      }
+    }
+
+    private fun parseAssignStmts(assigns: MutableList<VerilogAssignStmt>, params: Map<String, Int>) {
       val line = expect("assign").line
-      val target = expectIdent().text
+      skipOptionalDriveOrDelay()
+      while (peek().type != TokenType.EOF) {
+        val lhsTerms = parseLhsTargets(params)
+        expect("=")
+        val expr = parseExpr(params)
+        emitConcatOrSingleAssign(lhsTerms, expr, line) { target, msb, lsb, msbE, lsbE, rhs ->
+          assigns += VerilogAssignStmt(target, msb, lsb, rhs, line, msbE, lsbE)
+        }
+        if (!match(",")) break
+      }
+      expect(";")
+    }
+
+    private data class LhsTarget(
+      val name: String,
+      val msb: Int? = null,
+      val lsb: Int? = null,
+      val msbExpr: VerilogExpr? = null,
+      val lsbExpr: VerilogExpr? = null,
+      val widthHint: Int = 1,
+    )
+
+    private fun parseLhsTargets(params: Map<String, Int>): List<LhsTarget> {
+      if (match("{")) {
+        val parts = mutableListOf<LhsTarget>()
+        while (peek().text != "}" && peek().type != TokenType.EOF) {
+          parts += parseLhsTargets(params)
+          if (!match(",")) break
+        }
+        expect("}")
+        return parts
+      }
+      val baseTok = expectIdent()
+      var targetName = baseTok.text
       var tMsb: Int? = null
       var tLsb: Int? = null
       var tMsbExpr: VerilogExpr? = null
       var tLsbExpr: VerilogExpr? = null
-      if (match("[")) {
-        val mExpr = parseExpr(params)
-        val lExpr = if (match(":")) parseExpr(params) else mExpr
-        expect("]")
-        tMsbExpr = mExpr
-        tLsbExpr = lExpr
-        tMsb = evalConstInt(mExpr, params)
-        tLsb = evalConstInt(lExpr, params)
+      var wHint = signalWidths[targetName] ?: 1
+
+      // Chained field (.field) and bracket ([...]) selectors on LHS
+      while (peek().text == "[" || peek().text == ".") {
+        if (match(".")) {
+          val field = expectIdent().text
+          if (targetName !in signalWidths) targetName = "${targetName}_$field"
+        } else if (match("[")) {
+          val (mE, lE, sliceW) = parseBracketSliceSpec(params)
+          if (sliceW != null || peek().text != "[") {
+            tMsbExpr = mE
+            tLsbExpr = lE
+            tMsb = evalConstInt(mE, params)
+            tLsb = evalConstInt(lE, params)
+            wHint = sliceW ?: 1
+          }
+        }
       }
-      expect("=")
-      val expr = parseExpr(params)
-      expect(";")
-      return VerilogAssignStmt(target, tMsb, tLsb, expr, line, tMsbExpr, tLsbExpr)
+      return listOf(LhsTarget(targetName, tMsb, tLsb, tMsbExpr, tLsbExpr, wHint))
+    }
+
+    private fun emitConcatOrSingleAssign(
+      lhsTerms: List<LhsTarget>,
+      rhsExpr: VerilogExpr,
+      line: Int,
+      emit: (target: String, msb: Int?, lsb: Int?, msbE: VerilogExpr?, lsbE: VerilogExpr?, rhs: VerilogExpr) -> Unit,
+    ) {
+      if (lhsTerms.size <= 1) {
+        val t = lhsTerms.firstOrNull() ?: return
+        emit(t.name, t.msb, t.lsb, t.msbExpr, t.lsbExpr, rhsExpr)
+        return
+      }
+      var shiftOffset = 0
+      for (t in lhsTerms.asReversed()) {
+        val shiftedRhs = if (shiftOffset == 0) {
+          rhsExpr
+        } else {
+          VerilogExpr.Binary(">>", rhsExpr, VerilogExpr.Const(shiftOffset, 32))
+        }
+        emit(t.name, t.msb, t.lsb, t.msbExpr, t.lsbExpr, shiftedRhs)
+        shiftOffset += t.widthHint.coerceAtLeast(1)
+      }
+    }
+
+    private fun parseBracketSliceSpec(params: Map<String, Int>): Triple<VerilogExpr, VerilogExpr, Int?> {
+      val first = parseExpr(params)
+      return when {
+        match(":") -> {
+          val second = parseExpr(params)
+          expect("]")
+          val w = max(1, abs(evalConstInt(first, params) - evalConstInt(second, params)) + 1)
+          Triple(first, second, w)
+        }
+        match("+:") -> {
+          val widthE = parseExpr(params)
+          expect("]")
+          val w = evalConstInt(widthE, params).coerceAtLeast(1)
+          val msbE = VerilogExpr.Binary("+", first, VerilogExpr.Const(w - 1, 32))
+          Triple(msbE, first, w)
+        }
+        match("-:") -> {
+          val widthE = parseExpr(params)
+          expect("]")
+          val w = evalConstInt(widthE, params).coerceAtLeast(1)
+          val lsbE = VerilogExpr.Binary("-", first, VerilogExpr.Const(w - 1, 32))
+          Triple(first, lsbE, w)
+        }
+        else -> {
+          expect("]")
+          Triple(first, first, null)
+        }
+      }
     }
 
     private fun parseModuleInstance(params: Map<String, Int>): VerilogModuleInstance {
       val modTypeTok = expectIdent()
+      val paramOverrides = linkedMapOf<String, Int>()
       if (match("#")) {
         expect("(")
-        var depth = 1
-        while (depth > 0 && peek().type != TokenType.EOF) {
-          when (consume().text) {
-            "(" -> depth++
-            ")" -> depth--
+        while (peek().text != ")" && peek().type != TokenType.EOF) {
+          if (match(".")) {
+            val pName = expectIdent().text
+            expect("(")
+            if (peek().text != ")") {
+              if (peek().text in svTypeKeywords || peek().text == "type") {
+                skipBalancedUntil(setOf(")"))
+              } else {
+                paramOverrides[pName] = evalConstInt(parseExpr(params), params)
+              }
+            }
+            expect(")")
+          } else {
+            parseExpr(params)
           }
+          if (!match(",")) break
         }
+        expect(")")
       }
       val instTok = expectIdent()
+      // Instance array: `my_mod u_arr [3:0] (...)`
+      while (peek().text == "[") skipBracketGroup()
       expect("(")
       val named = linkedMapOf<String, VerilogExpr>()
       val positional = mutableListOf<VerilogExpr>()
       while (peek().text != ")" && peek().type != TokenType.EOF) {
-        if (match(".")) {
+        if (match(".*")) {
+          // SV implicit wildcard port connection
+        } else if (match(".")) {
           val portName = expectIdent().text
-          expect("(")
-          if (peek().text != ")") {
-            named[portName] = parseExpr(params)
+          if (match("(")) {
+            if (peek().text != ")") {
+              named[portName] = parseExpr(params)
+            }
+            expect(")")
+          } else {
+            // SV implicit `.portName` port connection
+            named[portName] = VerilogExpr.Signal(portName)
           }
-          expect(")")
         } else {
           positional += parseExpr(params)
         }
@@ -776,31 +1253,75 @@ object VerilogHdlParser {
         portConnections = named,
         positionalConnections = positional,
         line = modTypeTok.line,
+        paramOverrides = paramOverrides,
       )
     }
 
-    private fun parseVectorRange(params: Map<String, Int>): Triple<Int, Int, Int> {
+    private fun parseMultiPackedRanges(params: Map<String, Int>): Triple<Int, Int, Int> {
+      var totalWidth = 1
+      var firstRange = Triple(1, 0, 0)
+      var count = 0
+      while (peek().text == "[") {
+        val r = parseSingleVectorRange(params)
+        if (count == 0) firstRange = r
+        totalWidth *= r.first
+        count++
+      }
+      return if (count == 1) firstRange else Triple(totalWidth, totalWidth - 1, 0)
+    }
+
+    private fun parseSingleVectorRange(params: Map<String, Int>): Triple<Int, Int, Int> {
       expect("[")
-      val msb = evalConstInt(parseExpr(params), params)
-      expect(":")
-      val lsb = evalConstInt(parseExpr(params), params)
-      expect("]")
-      val width = max(1, abs(msb - lsb) + 1)
-      return Triple(width, msb, lsb)
+      val firstExpr = parseExpr(params)
+      val firstVal = evalConstInt(firstExpr, params)
+      return if (match(":")) {
+        val lsb = evalConstInt(parseExpr(params), params)
+        expect("]")
+        val width = max(1, abs(firstVal - lsb) + 1)
+        Triple(width, firstVal, lsb)
+      } else {
+        expect("]")
+        val width = max(1, firstVal)
+        Triple(width, width - 1, 0)
+      }
     }
 
     private fun evalConstInt(expr: VerilogExpr, params: Map<String, Int>): Int = when (expr) {
       is VerilogExpr.Const -> expr.value
-      is VerilogExpr.Signal -> params[expr.name] ?: 0
+      is VerilogExpr.Signal -> params[expr.name] ?: globalPackageConsts[expr.name] ?: 0
+      is VerilogExpr.FuncCall -> {
+        val vals = expr.args.map { evalConstInt(it, params) }
+        when (expr.name.lowercase()) {
+          "\$clog2" -> {
+            val v = vals.firstOrNull() ?: 0
+            if (v <= 1) 0 else 32 - Integer.numberOfLeadingZeros(v - 1)
+          }
+          "\$signed", "\$unsigned" -> vals.firstOrNull() ?: 0
+          "\$bits" -> {
+            val firstArg = expr.args.firstOrNull()
+            if (firstArg is VerilogExpr.Signal) signalWidths[firstArg.name] ?: 32 else 32
+          }
+          else -> vals.firstOrNull() ?: 0
+        }
+      }
       is VerilogExpr.Binary -> when (expr.op) {
         "+" -> evalConstInt(expr.left, params) + evalConstInt(expr.right, params)
         "-" -> evalConstInt(expr.left, params) - evalConstInt(expr.right, params)
         "*" -> evalConstInt(expr.left, params) * evalConstInt(expr.right, params)
         "/" -> evalConstInt(expr.right, params).let { d -> if (d == 0) 0 else evalConstInt(expr.left, params) / d }
-        "<<" -> evalConstInt(expr.left, params) shl evalConstInt(expr.right, params).coerceIn(0, 30)
-        ">>" -> evalConstInt(expr.left, params) shr evalConstInt(expr.right, params).coerceIn(0, 30)
-        "==" -> if (evalConstInt(expr.left, params) == evalConstInt(expr.right, params)) 1 else 0
-        "!=" -> if (evalConstInt(expr.left, params) != evalConstInt(expr.right, params)) 1 else 0
+        "%" -> evalConstInt(expr.right, params).let { d -> if (d == 0) 0 else evalConstInt(expr.left, params) % d }
+        "**" -> {
+          val base = evalConstInt(expr.left, params)
+          val exp = evalConstInt(expr.right, params).coerceIn(0, 30)
+          var acc = 1
+          repeat(exp) { acc *= base }
+          acc
+        }
+        "<<" , "<<<" -> evalConstInt(expr.left, params) shl evalConstInt(expr.right, params).coerceIn(0, 30)
+        ">>" -> evalConstInt(expr.left, params) ushr evalConstInt(expr.right, params).coerceIn(0, 30)
+        ">>>" -> evalConstInt(expr.left, params) shr evalConstInt(expr.right, params).coerceIn(0, 30)
+        "==", "===", "==?" -> if (evalConstInt(expr.left, params) == evalConstInt(expr.right, params)) 1 else 0
+        "!=", "!==", "!=?" -> if (evalConstInt(expr.left, params) != evalConstInt(expr.right, params)) 1 else 0
         "<" -> if (evalConstInt(expr.left, params) < evalConstInt(expr.right, params)) 1 else 0
         "<=" -> if (evalConstInt(expr.left, params) <= evalConstInt(expr.right, params)) 1 else 0
         ">" -> if (evalConstInt(expr.left, params) > evalConstInt(expr.right, params)) 1 else 0
@@ -810,12 +1331,19 @@ object VerilogHdlParser {
         "&" -> evalConstInt(expr.left, params) and evalConstInt(expr.right, params)
         "|" -> evalConstInt(expr.left, params) or evalConstInt(expr.right, params)
         "^" -> evalConstInt(expr.left, params) xor evalConstInt(expr.right, params)
+        "~&" -> (evalConstInt(expr.left, params) and evalConstInt(expr.right, params)).inv()
+        "~|" -> (evalConstInt(expr.left, params) or evalConstInt(expr.right, params)).inv()
+        "~^", "^~" -> (evalConstInt(expr.left, params) xor evalConstInt(expr.right, params)).inv()
         else -> 0
       }
       is VerilogExpr.Unary -> when (expr.op) {
         "-" -> -evalConstInt(expr.inner, params)
+        "+" -> evalConstInt(expr.inner, params)
         "!" -> if (evalConstInt(expr.inner, params) == 0) 1 else 0
         "~" -> evalConstInt(expr.inner, params).inv()
+        "&" -> if (evalConstInt(expr.inner, params) == -1) 1 else 0
+        "|" -> if (evalConstInt(expr.inner, params) != 0) 1 else 0
+        "^" -> Integer.bitCount(evalConstInt(expr.inner, params)) % 2
         else -> evalConstInt(expr.inner, params)
       }
       is VerilogExpr.Ternary -> {
@@ -888,20 +1416,56 @@ object VerilogHdlParser {
 
     private fun parseStmtOrBlock(params: Map<String, Int>): List<VerilogStmt> {
       if (match("begin")) {
-        if (match(":")) expectIdent()
+        if (match(":")) expectIdentIfPresent()
         val list = mutableListOf<VerilogStmt>()
+        val localParams = params.toMutableMap()
         while (peek().text != "end" && peek().type != TokenType.EOF) {
-          list += parseSingleStmtExpanded(params)
+          when (peek().text) {
+            ";" -> consume()
+            "localparam", "parameter" -> {
+              val isL = consume().text == "localparam"
+              parseParamDecls(mutableListOf(), localParams, isL)
+              match(";")
+            }
+            "integer", "int", "logic", "reg", "bit" -> {
+              val kw = consume().text
+              if (peek().text == "signed" || peek().text == "unsigned") consume()
+              if (peek().text == "[") parseMultiPackedRanges(localParams)
+              while (peek().type != TokenType.EOF && peek().text != ";") {
+                val nTok = expectIdent()
+                while (peek().text == "[") skipBracketGroup()
+                if (match("=")) {
+                  val e = parseExpr(localParams)
+                  list += VerilogStmt.Assign(nTok.text, e, nonBlocking = false, line = nTok.line)
+                } else if (kw == "int" || kw == "integer") {
+                  // Keep signal trackable
+                }
+                if (!match(",")) break
+              }
+              expect(";")
+            }
+            else -> list += parseSingleStmtExpanded(localParams)
+          }
         }
         expect("end")
+        if (match(":")) expectIdentIfPresent()
         return list
       }
+      if (match(";")) return emptyList()
       return parseSingleStmtExpanded(params)
     }
 
     private fun parseSingleStmtExpanded(params: Map<String, Int>): List<VerilogStmt> {
+      // Skip optional inline SV modifiers (`unique`, `unique0`, `priority`) and timing prefixes (`#1`)
+      while (peek().text in setOf("unique", "unique0", "priority")) consume()
+      if (match("#")) {
+        if (peek().text == "(") skipParenGroup() else if (peek().type == TokenType.NUMBER || peek().type == TokenType.IDENT) consume()
+      }
+      if (match(";")) return emptyList()
+
       val t = peek()
       return when (t.text) {
+        "begin" -> parseStmtOrBlock(params)
         "if" -> {
           val line = consume().line
           expect("(")
@@ -924,8 +1488,8 @@ object VerilogHdlParser {
               defaultB = parseStmtOrBlock(params)
             } else {
               val patterns = mutableListOf<VerilogExpr>()
-              patterns += parseExpr(params)
-              while (match(",")) patterns += parseExpr(params)
+              patterns += parseCasePatternExpr(params)
+              while (match(",")) patterns += parseCasePatternExpr(params)
               expect(":")
               val body = parseStmtOrBlock(params)
               branches += patterns to body
@@ -935,43 +1499,127 @@ object VerilogHdlParser {
           listOf(VerilogStmt.CaseStmt(sel, branches, defaultB, line))
         }
         "for" -> parseForLoopStmts(params)
+        "repeat" -> parseRepeatLoopStmts(params)
+        "while" -> {
+          consume()
+          skipParenGroup()
+          parseStmtOrBlock(params)
+          emptyList()
+        }
+        "assert", "assume", "cover" -> {
+          consume()
+          match("property") || match("final")
+          if (match("#")) {
+            if (peek().type == TokenType.NUMBER || peek().type == TokenType.IDENT) consume()
+          }
+          if (peek().text == "(") skipParenGroup()
+          if (match("else")) parseStmtOrBlock(params) else match(";")
+          emptyList()
+        }
+        "disable" -> {
+          skipUntilSemicolon()
+          emptyList()
+        }
         else -> {
+          // Ignore non-synthesizable PLI/system calls `$display`, `$finish`, etc.
+          if (t.type == TokenType.IDENT && t.text.startsWith("$")) {
+            consume()
+            if (peek().text == "(") skipParenGroup()
+            match(";")
+            return emptyList()
+          }
           val line = t.line
-          val target = expectIdent().text
-          var tMsb: Int? = null
-          var tLsb: Int? = null
-          var tMsbExpr: VerilogExpr? = null
-          var tLsbExpr: VerilogExpr? = null
-          if (match("[")) {
-            val mExpr = parseExpr(params)
-            val lExpr = if (match(":")) parseExpr(params) else mExpr
-            expect("]")
-            tMsbExpr = mExpr
-            tLsbExpr = lExpr
-            tMsb = evalConstInt(mExpr, params)
-            tLsb = evalConstInt(lExpr, params)
+          val lhsTerms = parseLhsTargets(params)
+          when {
+            match("++") -> {
+              expect(";")
+              val target = lhsTerms.firstOrNull()?.name ?: ""
+              return listOf(
+                VerilogStmt.Assign(
+                  target = target,
+                  expr = VerilogExpr.Binary("+", VerilogExpr.Signal(target), VerilogExpr.Const(1, 32)),
+                  nonBlocking = false,
+                  line = line,
+                )
+              )
+            }
+            match("--") -> {
+              expect(";")
+              val target = lhsTerms.firstOrNull()?.name ?: ""
+              return listOf(
+                VerilogStmt.Assign(
+                  target = target,
+                  expr = VerilogExpr.Binary("-", VerilogExpr.Signal(target), VerilogExpr.Const(1, 32)),
+                  nonBlocking = false,
+                  line = line,
+                )
+              )
+            }
+            peek().text in setOf("+=", "-=", "&=", "|=", "^=") -> {
+              val opStr = consume().text.substring(0, 1)
+              val expr = parseExpr(params)
+              expect(";")
+              val target = lhsTerms.firstOrNull() ?: return emptyList()
+              return listOf(
+                VerilogStmt.Assign(
+                  target = target.name,
+                  expr = VerilogExpr.Binary(opStr, VerilogExpr.Signal(target.name), expr),
+                  nonBlocking = false,
+                  line = line,
+                  targetMsb = target.msb,
+                  targetLsb = target.lsb,
+                  targetMsbExpr = target.msbExpr,
+                  targetLsbExpr = target.lsbExpr,
+                )
+              )
+            }
           }
           val nonBlocking = match("<=")
           if (!nonBlocking) expect("=")
           val expr = parseExpr(params)
           expect(";")
-          listOf(VerilogStmt.Assign(target, expr, nonBlocking, line, tMsb, tLsb, tMsbExpr, tLsbExpr))
+          val out = mutableListOf<VerilogStmt>()
+          emitConcatOrSingleAssign(lhsTerms, expr, line) { target, msb, lsb, msbE, lsbE, rhs ->
+            out += VerilogStmt.Assign(target, rhs, nonBlocking, line, msb, lsb, msbE, lsbE)
+          }
+          out
         }
       }
+    }
+
+    private fun parseCasePatternExpr(params: Map<String, Int>): VerilogExpr {
+      // Handle SystemVerilog case range `[lo:hi]` or normal expression
+      if (match("[")) {
+        val lo = parseExpr(params)
+        if (match(":")) parseExpr(params)
+        expect("]")
+        return lo
+      }
+      return parseExpr(params)
+    }
+
+    private fun parseRepeatLoopStmts(params: Map<String, Int>): List<VerilogStmt> {
+      expect("repeat")
+      expect("(")
+      val count = evalConstInt(parseExpr(params), params).coerceIn(0, 256)
+      expect(")")
+      val template = parseStmtOrBlock(params)
+      val out = mutableListOf<VerilogStmt>()
+      repeat(count) { out += template }
+      return out
     }
 
     private data class ForLoopHeader(
       val varName: String,
       val initValue: Int,
       val condExpr: VerilogExpr,
-      val stepOp: String, // "+", "-", "=", etc.
+      val stepOp: String,
       val stepExpr: VerilogExpr?,
     )
 
     private fun parseForLoopHeader(params: Map<String, Int>): ForLoopHeader {
       expect("for")
       expect("(")
-      // Optional inline integer/genvar type
       if (peek().text in setOf("integer", "int", "genvar")) consume()
       val varName = expectIdent().text
       expect("=")
@@ -979,20 +1627,33 @@ object VerilogHdlParser {
       expect(";")
       val condExpr = parseExpr(params)
       expect(";")
-      val stepVar = expectIdent().text
-      val (stepOp, stepExpr) = when {
-        match("++") -> "+" to VerilogExpr.Const(1, 32)
-        match("--") -> "-" to VerilogExpr.Const(1, 32)
-        match("+=") -> "+" to parseExpr(params)
-        match("-=") -> "-" to parseExpr(params)
-        else -> {
-          expect("=")
-          "=" to parseExpr(params)
+      val stepOp: String
+      val stepExpr: VerilogExpr
+      if (match("++")) {
+        expectIdent()
+        stepOp = "+"
+        stepExpr = VerilogExpr.Const(1, 32)
+      } else if (match("--")) {
+        expectIdent()
+        stepOp = "-"
+        stepExpr = VerilogExpr.Const(1, 32)
+      } else {
+        expectIdent()
+        val pair = when {
+          match("++") -> "+" to VerilogExpr.Const(1, 32)
+          match("--") -> "-" to VerilogExpr.Const(1, 32)
+          match("+=") -> "+" to parseExpr(params)
+          match("-=") -> "-" to parseExpr(params)
+          else -> {
+            expect("=")
+            "=" to parseExpr(params)
+          }
         }
+        stepOp = pair.first
+        stepExpr = pair.second
       }
       expect(")")
-      val resolvedStepExpr = if (stepOp == "=" && stepExpr == null) VerilogExpr.Signal(stepVar) else stepExpr
-      return ForLoopHeader(varName, initVal, condExpr, stepOp, resolvedStepExpr)
+      return ForLoopHeader(varName, initVal, condExpr, stepOp, stepExpr)
     }
 
     private fun advanceForLoopVar(header: ForLoopHeader, curr: Int, params: Map<String, Int>): Int {
@@ -1011,7 +1672,7 @@ object VerilogHdlParser {
       val unrolled = mutableListOf<VerilogStmt>()
       var loopVal = header.initValue
       var guard = 0
-      while (guard < 128) {
+      while (guard < 512) {
         val env = params + (header.varName to loopVal)
         if (evalConstInt(header.condExpr, env) == 0) break
         templateStmts.forEach { stmt ->
@@ -1036,15 +1697,19 @@ object VerilogHdlParser {
     ) {
       if (peek().type == TokenType.EOF || peek().text in endKeywords) return
       when (peek().text) {
+        ";" -> consume()
         "input", "output", "inout" -> parseBodyPortDecl(ports, signals, paramMap)
-        "wire", "reg", "logic", "integer" -> parseSignalDecl(signals, paramMap)
+        "wire", "reg", "logic", "bit", "byte", "shortint", "int", "longint", "integer", "tri", "supply0", "supply1" ->
+          parseSignalDecl(signals, paramMap, assigns)
         "genvar" -> parseGenvarDecl(genvars)
         "parameter", "localparam" -> {
           val isLocal = consume().text == "localparam"
           parseParamDecls(parameters, paramMap, isLocal)
           expect(";")
         }
-        "assign" -> assigns += parseAssignStmt(paramMap)
+        "import" -> skipUntilSemicolon()
+        "typedef", "enum" -> parseTypedefOrEnum(paramMap, signals)
+        "assign" -> parseAssignStmts(assigns, paramMap)
         "always", "always_comb", "always_ff", "always_latch" -> alwaysBlocks += parseAlwaysBlock(paramMap)
         "generate" -> {
           consume()
@@ -1064,16 +1729,105 @@ object VerilogHdlParser {
           ports, signals, parameters, paramMap, genvars,
           assigns, alwaysBlocks, instances,
         )
-        "initial" -> skipBlockOrStmt()
-        "function", "task" -> skipUntilKeyword(if (peek().text == "function") "endfunction" else "endtask")
+        "case", "casez", "casex" -> parseGenerateCase(
+          ports, signals, parameters, paramMap, genvars,
+          assigns, alwaysBlocks, instances,
+        )
+        "initial", "final" -> skipBlockOrStmt()
+        "function" -> parseFunctionDecl(paramMap, moduleFunctions)
+        "task" -> {
+          skipUntilKeyword("endtask")
+          if (match(":")) expectIdentIfPresent()
+        }
+        "specify" -> skipUntilKeyword("endspecify")
+        "property" -> {
+          if (peek(1).text == "(") {
+            consume(); skipParenGroup(); match(";")
+          } else {
+            skipUntilKeyword("endproperty")
+            if (match(":")) expectIdentIfPresent()
+          }
+        }
+        "sequence" -> {
+          if (peek(1).text == "(") {
+            consume(); skipParenGroup(); match(";")
+          } else {
+            skipUntilKeyword("endsequence")
+            if (match(":")) expectIdentIfPresent()
+          }
+        }
+        "defparam" -> skipUntilSemicolon()
+        "assert", "assume", "cover" -> {
+          consume()
+          match("property") || match("final")
+          if (match("#")) {
+            if (peek().type == TokenType.NUMBER || peek().type == TokenType.IDENT) consume()
+          }
+          skipParenGroup()
+          if (match("else")) skipBlockOrStmt() else match(";")
+        }
+        in gatePrimitives -> parseGatePrimitive(assigns, paramMap)
         else -> {
           if (peek().type == TokenType.IDENT && peek().text !in verilogKeywords) {
-            instances += parseModuleInstance(paramMap)
+            if (peek(1).text == ":" && peek(2).text in setOf("assert", "assume", "cover", "for", "if", "case", "casez", "casex", "begin", "generate")) {
+              consume(); consume() // skip label:
+              return
+            }
+            val isScopedVar = peek(1).text == "::" && peek(2).type == TokenType.IDENT &&
+              (peek(3).type == TokenType.IDENT || peek(3).text == "[")
+            val isCustomTypeVar = peek(1).type == TokenType.IDENT &&
+              (peek(2).text == ";" || peek(2).text == "=" || peek(2).text == "," || peek(2).text == "[")
+            val isCustomPackedVar = peek(1).text == "[" && peek(2).text != "]"
+            if (isScopedVar || isCustomTypeVar || isCustomPackedVar) {
+              parseCustomTypedSignalDecl(signals, paramMap, assigns)
+            } else {
+              instances += parseModuleInstance(paramMap)
+            }
           } else {
             consume()
           }
         }
       }
+    }
+
+    private fun parseCustomTypedSignalDecl(
+      signals: MutableMap<String, VerilogLogicSignal>,
+      params: Map<String, Int>,
+      assigns: MutableList<VerilogAssignStmt>,
+    ) {
+      if (peek().type == TokenType.IDENT && peek(1).text == "::") {
+        consume() // package
+        consume() // ::
+      }
+      consume() // custom type identifier
+      val packedWidth = if (peek().text == "[") parseMultiPackedRanges(params).first else 8
+      while (peek().type != TokenType.EOF && peek().text != ";") {
+        val nameTok = expectIdent()
+        while (peek().text == "[") skipBracketGroup()
+        signals.putIfAbsent(
+          nameTok.text,
+          VerilogLogicSignal(
+            nameTok.text,
+            LogicSignalKind.LOGIC,
+            packedWidth,
+            packedWidth - 1,
+            0,
+            isSigned = false,
+            isPort = false,
+            line = nameTok.line,
+          ),
+        )
+        signalWidths.putIfAbsent(nameTok.text, packedWidth)
+        if (match("=")) {
+          if (peek().text == "'{" || (peek().text == "{" && looksLikeArrayLiteral())) {
+            skipBalancedUntil(setOf(",", ";"))
+          } else {
+            assigns += VerilogAssignStmt(nameTok.text, expr = parseExpr(params), line = nameTok.line)
+          }
+        }
+        if (!match(",")) break
+      }
+      expect(";")
     }
 
     private fun parseGenvarDecl(genvars: MutableSet<String>) {
@@ -1106,7 +1860,7 @@ object VerilogHdlParser {
 
       var loopVal = header.initValue
       var guard = 0
-      while (guard < 128) {
+      while (guard < 512) {
         val env = paramMap.toMutableMap().apply { put(header.varName, loopVal) }
         if (evalConstInt(header.condExpr, env) == 0) break
         pos = bodyStartPos
@@ -1157,26 +1911,102 @@ object VerilogHdlParser {
       pos = if (hasElse) elseEnd else thenEnd
     }
 
-    private fun findBlockOrStmtEndPos(): Int {
-      val saved = pos
-      if (match("begin")) {
-        if (match(":")) {
-          if (peek().type == TokenType.IDENT) consume()
-        }
-        var depth = 1
-        while (depth > 0 && peek().type != TokenType.EOF) {
-          when (consume().text) {
-            "begin" -> depth++
-            "end" -> depth--
+    private fun parseGenerateCase(
+      ports: MutableList<RtlPort>,
+      signals: MutableMap<String, VerilogLogicSignal>,
+      parameters: MutableList<VerilogParameter>,
+      paramMap: MutableMap<String, Int>,
+      genvars: MutableSet<String>,
+      assigns: MutableList<VerilogAssignStmt>,
+      alwaysBlocks: MutableList<VerilogAlwaysBlock>,
+      instances: MutableList<VerilogModuleInstance>,
+    ) {
+      consume() // case / casez / casex
+      expect("(")
+      val selVal = evalConstInt(parseExpr(paramMap), paramMap)
+      expect(")")
+      var matched = false
+      while (peek().text != "endcase" && peek().type != TokenType.EOF) {
+        if (match("default")) {
+          match(":")
+          if (!matched) {
+            matched = true
+            parseGenerateBodySlice(
+              ports, signals, parameters, paramMap, genvars,
+              assigns, alwaysBlocks, instances, loopSuffix = "",
+            )
+          } else {
+            pos = findBlockOrStmtEndPos()
+          }
+        } else {
+          val pats = mutableListOf<Int>()
+          pats += evalConstInt(parseExpr(paramMap), paramMap)
+          while (match(",")) pats += evalConstInt(parseExpr(paramMap), paramMap)
+          expect(":")
+          if (!matched && selVal in pats) {
+            matched = true
+            parseGenerateBodySlice(
+              ports, signals, parameters, paramMap, genvars,
+              assigns, alwaysBlocks, instances, loopSuffix = "",
+            )
+          } else {
+            pos = findBlockOrStmtEndPos()
           }
         }
-      } else {
-        while (peek().text != ";" && peek().type != TokenType.EOF) consume()
-        match(";")
       }
+      expect("endcase")
+    }
+
+    private fun findBlockOrStmtEndPos(): Int {
+      val saved = pos
+      skipCompleteGenerateItem()
       val endPos = pos
       pos = saved
       return endPos
+    }
+
+    private fun skipCompleteGenerateItem() {
+      when {
+        match("begin") -> {
+          if (match(":")) expectIdentIfPresent()
+          var depth = 1
+          while (depth > 0 && peek().type != TokenType.EOF) {
+            when (consume().text) {
+              "begin" -> depth++
+              "end" -> depth--
+            }
+          }
+          if (match(":")) expectIdentIfPresent()
+        }
+        match("if") -> {
+          skipParenGroup()
+          skipCompleteGenerateItem()
+          if (match("else")) skipCompleteGenerateItem()
+        }
+        match("for") -> {
+          skipParenGroup()
+          skipCompleteGenerateItem()
+        }
+        match("case") || match("casez") || match("casex") -> {
+          var depth = 1
+          while (depth > 0 && peek().type != TokenType.EOF) {
+            when (consume().text) {
+              "case", "casez", "casex" -> depth++
+              "endcase" -> depth--
+            }
+          }
+        }
+        match("always") || match("always_ff") || match("always_comb") || match("always_latch") -> {
+          if (match("@")) {
+            if (!match("*")) skipParenGroup()
+          }
+          skipCompleteGenerateItem()
+        }
+        else -> {
+          while (peek().text != ";" && peek().type != TokenType.EOF) consume()
+          match(";")
+        }
+      }
     }
 
     private fun parseGenerateBodySlice(
@@ -1192,7 +2022,7 @@ object VerilogHdlParser {
     ) {
       val iterInst = mutableListOf<VerilogModuleInstance>()
       if (match("begin")) {
-        if (match(":")) expectIdent()
+        if (match(":")) expectIdentIfPresent()
         while (peek().type != TokenType.EOF && peek().text != "end") {
           parseModuleItem(
             ports, signals, parameters, localParams, genvars,
@@ -1200,6 +2030,7 @@ object VerilogHdlParser {
           )
         }
         match("end")
+        if (match(":")) expectIdentIfPresent()
       } else {
         parseModuleItem(
           ports, signals, parameters, localParams, genvars,
@@ -1224,6 +2055,11 @@ object VerilogHdlParser {
           val newLsb = lExpr?.let { evalConstInt(it, env) } ?: expr.lsb
           expr.copy(msb = newMsb, lsb = newLsb, msbExpr = mExpr, lsbExpr = lExpr)
         }
+        is VerilogExpr.Index -> VerilogExpr.Index(
+          base = substituteLoopExpr(expr.base, varName, value, params),
+          indexExpr = substituteLoopExpr(expr.indexExpr, varName, value, params),
+          width = expr.width,
+        )
         is VerilogExpr.Concat -> VerilogExpr.Concat(expr.parts.map { substituteLoopExpr(it, varName, value, params) })
         is VerilogExpr.Replication -> VerilogExpr.Replication(expr.count, substituteLoopExpr(expr.inner, varName, value, params))
         is VerilogExpr.Unary -> VerilogExpr.Unary(expr.op, substituteLoopExpr(expr.inner, varName, value, params))
@@ -1236,6 +2072,10 @@ object VerilogHdlParser {
           substituteLoopExpr(expr.cond, varName, value, params),
           substituteLoopExpr(expr.thenExpr, varName, value, params),
           substituteLoopExpr(expr.elseExpr, varName, value, params),
+        )
+        is VerilogExpr.FuncCall -> VerilogExpr.FuncCall(
+          expr.name,
+          expr.args.map { substituteLoopExpr(it, varName, value, params) },
         )
       }
     }
@@ -1282,6 +2122,7 @@ object VerilogHdlParser {
             "end", "endgenerate" -> depth--
           }
         }
+        if (match(":")) expectIdentIfPresent()
       } else {
         while (peek().text != ";" && peek().type != TokenType.EOF) consume()
         match(";")
@@ -1292,6 +2133,51 @@ object VerilogHdlParser {
       consume()
       while (peek().text != endKw && peek().type != TokenType.EOF) consume()
       match(endKw)
+    }
+
+    private fun skipUntilSemicolon() {
+      while (peek().text != ";" && peek().type != TokenType.EOF) consume()
+      match(";")
+    }
+
+    private fun skipParenGroup() {
+      if (!match("(")) return
+      var depth = 1
+      while (depth > 0 && peek().type != TokenType.EOF) {
+        when (consume().text) {
+          "(" -> depth++
+          ")" -> depth--
+        }
+      }
+    }
+
+    private fun skipBracketGroup() {
+      if (!match("[")) return
+      var depth = 1
+      while (depth > 0 && peek().type != TokenType.EOF) {
+        when (consume().text) {
+          "[" -> depth++
+          "]" -> depth--
+        }
+      }
+    }
+
+    private fun skipBalancedUntil(stopTokens: Set<String>) {
+      var paren = 0
+      var bracket = 0
+      var brace = 0
+      while (peek().type != TokenType.EOF) {
+        val t = peek().text
+        if (paren == 0 && bracket == 0 && brace == 0 && t in stopTokens) break
+        when (consume().text) {
+          "(" -> paren++
+          ")" -> paren = (paren - 1).coerceAtLeast(0)
+          "[" -> bracket++
+          "]" -> bracket = (bracket - 1).coerceAtLeast(0)
+          "{" -> brace++
+          "}" -> brace = (brace - 1).coerceAtLeast(0)
+        }
+      }
     }
 
     private fun parseExpr(params: Map<String, Int>): VerilogExpr = parseTernary(params)
@@ -1354,16 +2240,39 @@ object VerilogHdlParser {
 
     private fun parseEquality(params: Map<String, Int>): VerilogExpr {
       var left = parseRelational(params)
-      while (peek().text == "==" || peek().text == "!=") {
-        val op = consume().text
-        left = VerilogExpr.Binary(op, left, parseRelational(params))
+      while (peek().text in setOf("==", "!=", "===", "!==", "==?", "!=?") || peek().text == "inside") {
+        if (match("inside")) {
+          expect("{")
+          val conds = mutableListOf<VerilogExpr>()
+          while (peek().text != "}" && peek().type != TokenType.EOF) {
+            if (match("[")) {
+              val lo = parseExpr(params)
+              val hi = if (match(":")) parseExpr(params) else lo
+              expect("]")
+              conds += VerilogExpr.Binary(
+                "&&",
+                VerilogExpr.Binary(">=", left, lo),
+                VerilogExpr.Binary("<=", left, hi),
+              )
+            } else {
+              conds += VerilogExpr.Binary("==", left, parseExpr(params))
+            }
+            if (!match(",")) break
+          }
+          expect("}")
+          left = if (conds.isEmpty()) VerilogExpr.Const(0, 1)
+          else conds.reduce { a, b -> VerilogExpr.Binary("||", a, b) }
+        } else {
+          val op = consume().text
+          left = VerilogExpr.Binary(op, left, parseRelational(params))
+        }
       }
       return left
     }
 
     private fun parseRelational(params: Map<String, Int>): VerilogExpr {
       var left = parseShift(params)
-      while (peek().text in listOf("<", "<=", ">", ">=")) {
+      while (peek().text in setOf("<", "<=", ">", ">=")) {
         val op = consume().text
         left = VerilogExpr.Binary(op, left, parseShift(params))
       }
@@ -1372,7 +2281,7 @@ object VerilogHdlParser {
 
     private fun parseShift(params: Map<String, Int>): VerilogExpr {
       var left = parseAdditive(params)
-      while (peek().text == "<<" || peek().text == ">>") {
+      while (peek().text in setOf("<<", ">>", "<<<", ">>>")) {
         val op = consume().text
         left = VerilogExpr.Binary(op, left, parseAdditive(params))
       }
@@ -1389,8 +2298,17 @@ object VerilogHdlParser {
     }
 
     private fun parseMultiplicative(params: Map<String, Int>): VerilogExpr {
+      var left = parsePower(params)
+      while (peek().text == "*" || peek().text == "/" || peek().text == "%") {
+        val op = consume().text
+        left = VerilogExpr.Binary(op, left, parsePower(params))
+      }
+      return left
+    }
+
+    private fun parsePower(params: Map<String, Int>): VerilogExpr {
       var left = parseUnary(params)
-      while (peek().text == "*") {
+      while (peek().text == "**") {
         val op = consume().text
         left = VerilogExpr.Binary(op, left, parseUnary(params))
       }
@@ -1398,7 +2316,7 @@ object VerilogHdlParser {
     }
 
     private fun parseUnary(params: Map<String, Int>): VerilogExpr {
-      if (peek().text in listOf("~", "!", "-", "&", "|", "^")) {
+      if (peek().text in setOf("~", "!", "-", "+", "&", "|", "^", "~&", "~|", "~^", "^~")) {
         val op = consume().text
         return VerilogExpr.Unary(op, parseUnary(params))
       }
@@ -1414,39 +2332,122 @@ object VerilogHdlParser {
           inner
         }
         match("{") -> {
-          val first = parseExpr(params)
-          if (match("{")) {
-            // Replication operator {N{expr}}
-            val count = evalConstInt(first, params).coerceAtLeast(1)
-            val inner = parseExpr(params)
+          if (match("}")) {
+            VerilogExpr.Const(0, 1)
+          } else if (peek().text == "<<" || peek().text == ">>") {
+            // SystemVerilog streaming concatenation `{>>{a, b}}` or `{<<8{data}}`
+            consume()
+            if (peek().text != "{") parseExpr(params)
+            expect("{")
+            val parts = mutableListOf<VerilogExpr>()
+            while (peek().text != "}" && peek().type != TokenType.EOF) {
+              parts += parseExpr(params)
+              if (!match(",")) break
+            }
             expect("}")
             expect("}")
-            VerilogExpr.Replication(count, inner)
+            if (parts.size == 1) parts.first() else VerilogExpr.Concat(parts)
           } else {
-            val parts = mutableListOf(first)
-            while (match(",")) parts += parseExpr(params)
-            expect("}")
-            VerilogExpr.Concat(parts)
+            val first = parseExpr(params)
+            if (match("{")) {
+              val count = evalConstInt(first, params).coerceAtLeast(1)
+              val inner = parseExpr(params)
+              expect("}")
+              expect("}")
+              VerilogExpr.Replication(count, inner)
+            } else {
+              val parts = mutableListOf(first)
+              while (match(",")) parts += parseExpr(params)
+              expect("}")
+              VerilogExpr.Concat(parts)
+            }
           }
+        }
+        t.type == TokenType.STRING -> {
+          consume()
+          val content = t.text.removeSurrounding("\"")
+          var acc = 0
+          content.take(4).forEach { ch -> acc = (acc shl 8) or (ch.code and 0xFF) }
+          VerilogExpr.Const(acc, (content.length * 8).coerceIn(8, 64))
         }
         t.type == TokenType.NUMBER -> {
           consume()
-          parseVerilogNumber(t.text)
+          // Handle SystemVerilog static width cast e.g. `8'(a + b)`
+          if (t.text.endsWith("'") && peek().text == "(") {
+            consume()
+            val casted = parseExpr(params)
+            expect(")")
+            casted
+          } else {
+            parseVerilogNumber(t.text)
+          }
         }
         t.type == TokenType.IDENT -> {
-          val name = consume().text
-          if (match("[")) {
-            val msbExpr = parseExpr(params)
-            val lsbExpr = if (match(":")) parseExpr(params) else msbExpr
-            expect("]")
-            val msb = evalConstInt(msbExpr, params)
-            val lsb = evalConstInt(lsbExpr, params)
-            VerilogExpr.Slice(name, msb, lsb, msbExpr, lsbExpr)
-          } else if (name in params) {
-            VerilogExpr.Const(params[name] ?: 0, 32)
-          } else {
-            VerilogExpr.Signal(name)
+          var name = consume().text
+          // Scope resolution `pkg::CONST`
+          while (match("::")) {
+            name = expectIdent().text
           }
+          // Static type cast `signed'(expr)` / `logic'(expr)` / `N'(expr)`
+          if (peek().text.startsWith("'") && peek().text.length == 1 && peek(1).text == "(") {
+            consume() // '
+            consume() // (
+            val casted = parseExpr(params)
+            expect(")")
+            return casted
+          }
+          // Function / system call: `$clog2(N)`, `my_func(a, b)`
+          if (match("(")) {
+            val args = mutableListOf<VerilogExpr>()
+            while (peek().text != ")" && peek().type != TokenType.EOF) {
+              if (peek().text in svTypeKeywords || (peek().type == TokenType.IDENT && peek().text.endsWith("_t") && args.isEmpty() && name == "\$bits")) {
+                skipBalancedUntil(setOf(",", ")"))
+                args += VerilogExpr.Const(32, 32)
+              } else {
+                args += parseExpr(params)
+              }
+              if (!match(",")) break
+            }
+            expect(")")
+            val userFn = moduleFunctions[name]
+            return if (userFn != null) {
+              inlineUserFunction(userFn, args)
+            } else {
+              VerilogExpr.FuncCall(name, args)
+            }
+          }
+
+          var curExpr: VerilogExpr = when {
+            name in params -> VerilogExpr.Const(params[name] ?: 0, 32)
+            name in globalPackageConsts -> VerilogExpr.Const(globalPackageConsts[name] ?: 0, 32)
+            else -> VerilogExpr.Signal(name)
+          }
+
+          // Chained suffixes: `[...]` slices / indices / `+:` / `-:` and `.field`
+          while (peek().text == "[" || peek().text == ".") {
+            if (match(".")) {
+              val field = expectIdent().text
+              curExpr = when (curExpr) {
+                is VerilogExpr.Signal -> {
+                  val combined = "${curExpr.name}_$field"
+                  if (combined in params) VerilogExpr.Const(params[combined] ?: 0, 32)
+                  else VerilogExpr.Signal(if (curExpr.name in signalWidths) curExpr.name else combined)
+                }
+                else -> curExpr
+              }
+            } else if (match("[")) {
+              val (msbE, lsbE, sliceW) = parseBracketSliceSpec(params)
+              curExpr = when {
+                (sliceW != null || peek().text != "[") && curExpr is VerilogExpr.Signal -> {
+                  val msb = evalConstInt(msbE, params)
+                  val lsb = evalConstInt(lsbE, params)
+                  VerilogExpr.Slice(curExpr.name, msb, lsb, msbE, lsbE)
+                }
+                else -> VerilogExpr.Index(curExpr, msbE, sliceW ?: 1)
+              }
+            }
+          }
+          curExpr
         }
         else -> throw ParseException(
           t.line,
@@ -1456,24 +2457,74 @@ object VerilogHdlParser {
       }
     }
 
+    private fun inlineUserFunction(fn: VerilogFuncDef, args: List<VerilogExpr>): VerilogExpr {
+      val subst = fn.paramNames.mapIndexed { idx, pName -> pName to (args.getOrNull(idx) ?: VerilogExpr.Const(0, 1)) }.toMap()
+      return substituteExprVars(fn.bodyExpr, subst)
+    }
+
+    private fun substituteExprVars(expr: VerilogExpr, subst: Map<String, VerilogExpr>): VerilogExpr = when (expr) {
+      is VerilogExpr.Const -> expr
+      is VerilogExpr.Signal -> subst[expr.name] ?: expr
+      is VerilogExpr.Slice -> expr.copy(
+        msbExpr = expr.msbExpr?.let { substituteExprVars(it, subst) },
+        lsbExpr = expr.lsbExpr?.let { substituteExprVars(it, subst) },
+      )
+      is VerilogExpr.Index -> expr.copy(
+        base = substituteExprVars(expr.base, subst),
+        indexExpr = substituteExprVars(expr.indexExpr, subst),
+      )
+      is VerilogExpr.Concat -> VerilogExpr.Concat(expr.parts.map { substituteExprVars(it, subst) })
+      is VerilogExpr.Replication -> VerilogExpr.Replication(expr.count, substituteExprVars(expr.inner, subst))
+      is VerilogExpr.Unary -> VerilogExpr.Unary(expr.op, substituteExprVars(expr.inner, subst))
+      is VerilogExpr.Binary -> VerilogExpr.Binary(
+        expr.op,
+        substituteExprVars(expr.left, subst),
+        substituteExprVars(expr.right, subst),
+      )
+      is VerilogExpr.Ternary -> VerilogExpr.Ternary(
+        substituteExprVars(expr.cond, subst),
+        substituteExprVars(expr.thenExpr, subst),
+        substituteExprVars(expr.elseExpr, subst),
+      )
+      is VerilogExpr.FuncCall -> VerilogExpr.FuncCall(
+        expr.name,
+        expr.args.map { substituteExprVars(it, subst) },
+      )
+    }
+
+    private fun extractBaseName(expr: VerilogExpr): String? = when (expr) {
+      is VerilogExpr.Signal -> expr.name
+      is VerilogExpr.Slice -> expr.name
+      is VerilogExpr.Index -> extractBaseName(expr.base)
+      else -> null
+    }
+
     private fun parseVerilogNumber(raw: String): VerilogExpr.Const {
       val clean = raw.replace("_", "")
       if (!clean.contains('\'')) {
-        val v = clean.toIntOrNull() ?: 0
+        val intPart = clean.substringBefore('.')
+        val v = intPart.toLongOrNull()?.toInt() ?: 0
         return VerilogExpr.Const(v, max(1, 32 - Integer.numberOfLeadingZeros(max(1, v))))
       }
       val parts = clean.split('\'', limit = 2)
-      val width = parts[0].toIntOrNull() ?: 1
-      val body = parts[1]
-      val baseChar = body.firstOrNull()?.lowercaseChar() ?: 'd'
-      val digits = body.drop(1).replace('x', '0').replace('z', '0').replace('?', '0')
-      val value = when (baseChar) {
-        'b' -> digits.toIntOrNull(2) ?: 0
-        'h' -> digits.toIntOrNull(16) ?: 0
-        'o' -> digits.toIntOrNull(8) ?: 0
-        else -> digits.toIntOrNull(10) ?: 0
+      val width = parts[0].toIntOrNull()
+      val rawBody = parts[1]
+      // SystemVerilog unsized fill literals: '0, '1, 'x, 'z
+      if (width == null && rawBody.length == 1 && rawBody[0].lowercaseChar() in listOf('0', '1', 'x', 'z')) {
+        val fillVal = if (rawBody[0] == '1') -1 else 0
+        return VerilogExpr.Const(fillVal, 32)
       }
-      return VerilogExpr.Const(value, max(1, width))
+      val signedPrefix = rawBody.firstOrNull()?.lowercaseChar() == 's'
+      val body = if (signedPrefix) rawBody.drop(1) else rawBody
+      val baseChar = body.firstOrNull()?.lowercaseChar() ?: 'd'
+      val digits = body.drop(1).lowercase().replace('x', '0').replace('z', '0').replace('?', '0')
+      val value = when (baseChar) {
+        'b' -> digits.toLongOrNull(2)?.toInt() ?: 0
+        'h' -> digits.toLongOrNull(16)?.toInt() ?: 0
+        'o' -> digits.toLongOrNull(8)?.toInt() ?: 0
+        else -> digits.toLongOrNull(10)?.toInt() ?: 0
+      }
+      return VerilogExpr.Const(value, max(1, width ?: 32))
     }
   }
 }

@@ -115,4 +115,31 @@ class VerilogSyntaxHighlighterTest {
     assertEquals("  ^", snippet.caretLine)
     assertTrue(snippet.hint.contains("')'"))
   }
+
+  @Test
+  fun diagnosticFormatter_suggestsAndAppliesFixesForCommonVerilogErrors() {
+    // 1. Missing semicolon on assignment before endmodule
+    val missingSemi = "module m(input a, output y);\n  assign y = a // inv\nendmodule"
+    val err1 = com.example.domain.synth.VerilogHdlParser.parse(missingSemi)
+      as com.example.domain.synth.VerilogParseResult.Error
+    val fix1 = VerilogDiagnosticFormatter.buildSnippet(missingSemi, err1).suggestedFix
+    assertTrue(fix1 != null)
+    assertTrue(fix1!!.patchedSource.contains("assign y = a; // inv"))
+    assertTrue(com.example.domain.synth.VerilogHdlParser.parse(fix1.patchedSource) is com.example.domain.synth.VerilogParseResult.Success)
+
+    // 2. Missing endmodule
+    val missingEndMod = "module m(input a, output y);\n  assign y = ~a;"
+    val err2 = com.example.domain.synth.VerilogHdlParser.parse(missingEndMod)
+      as com.example.domain.synth.VerilogParseResult.Error
+    val fix2 = VerilogDiagnosticFormatter.buildSnippet(missingEndMod, err2).suggestedFix
+    assertTrue(fix2 != null)
+    assertTrue(com.example.domain.synth.VerilogHdlParser.parse(fix2!!.patchedSource) is com.example.domain.synth.VerilogParseResult.Success)
+
+    // 3. Empty file -> starter template
+    val err3 = com.example.domain.synth.VerilogHdlParser.parse("")
+      as com.example.domain.synth.VerilogParseResult.Error
+    val fix3 = VerilogDiagnosticFormatter.buildSnippet("", err3, com.example.data.model.RtlLanguage.VERILOG).suggestedFix
+    assertTrue(fix3 != null)
+    assertTrue(com.example.domain.synth.VerilogHdlParser.parse(fix3!!.patchedSource) is com.example.domain.synth.VerilogParseResult.Success)
+  }
 }

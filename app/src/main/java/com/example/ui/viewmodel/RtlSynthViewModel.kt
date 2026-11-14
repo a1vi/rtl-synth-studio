@@ -95,8 +95,8 @@ data class WorkbenchUiState(
   val parsedDesign: ParsedVerilogDesign? = null,
   val parseError: VerilogParseResult.Error? = null,
   val synthesisResult: SynthesisResult? = null,
-  val synthesisProgress: Float = 1f,
-  val synthesisPhaseLabel: String = "Idle",
+  val synthesisProgress: Float = 0f,
+  val synthesisPhaseLabel: String = "Ready — press Run to synthesize",
   val lastRunDurationMs: Long = 0L,
   val flowStages: List<FlowStageState> = RtlToGdsFlowEngine.initialStages(),
   val flowLogLines: List<String> = emptyList(),
@@ -177,7 +177,6 @@ class RtlSynthViewModel(
 
   init {
     refreshLiveParse()
-    runSynthesis()
     startLocalAutoSaveLoops()
   }
 
@@ -591,7 +590,9 @@ class RtlSynthViewModel(
         persistDraft(it)
       }
     }
-    runSynthesis()
+    if (_workbench.value.synthesisResult != null) {
+      runSynthesis()
+    }
   }
 
   fun updateDesignMetadata(name: String, description: String) {
@@ -643,7 +644,7 @@ class RtlSynthViewModel(
     val manualReport = (state.synthesisResult as? SynthesisResult.Success)?.report
     if (state.isManualSchematic && manualReport != null) {
       recomputeManualReport(manualReport, state.manualNodePositions, state.selectedNodeId)
-    } else {
+    } else if (state.synthesisResult != null) {
       runSynthesis()
     }
   }
@@ -654,14 +655,16 @@ class RtlSynthViewModel(
     val manualReport = (state.synthesisResult as? SynthesisResult.Success)?.report
     if (state.isManualSchematic && manualReport != null) {
       recomputeManualReport(manualReport, state.manualNodePositions, state.selectedNodeId)
-    } else {
+    } else if (state.synthesisResult != null) {
       runSynthesis()
     }
   }
 
   fun selectSynthesisEngine(engine: SynthesisEngineProfile) {
     _workbench.update { it.copy(synthesisEngine = engine, hasUnsavedChanges = true).also(::persistDraft) }
-    runSynthesis()
+    if (_workbench.value.synthesisResult != null) {
+      runSynthesis()
+    }
   }
 
   fun updateClockPeriodNs(periodNs: Double) {
@@ -686,7 +689,7 @@ class RtlSynthViewModel(
     val manualReport = (state.synthesisResult as? SynthesisResult.Success)?.report
     if (state.isManualSchematic && manualReport != null) {
       recomputeManualReport(manualReport, state.manualNodePositions, state.selectedNodeId)
-    } else {
+    } else if (state.synthesisResult != null) {
       runSynthesis()
     }
   }
@@ -709,7 +712,7 @@ class RtlSynthViewModel(
     val manualReport = (state.synthesisResult as? SynthesisResult.Success)?.report
     if (state.isManualSchematic && manualReport != null) {
       recomputeManualReport(manualReport, state.manualNodePositions, state.selectedNodeId)
-    } else {
+    } else if (state.synthesisResult != null) {
       runSynthesis()
     }
   }
@@ -781,15 +784,22 @@ class RtlSynthViewModel(
           activeFileId = files.first().id,
           primaryLanguage = detectedLang,
           selectedTopModule = null,
+          synthesisResult = null,
+          synthesisProgress = 0f,
+          synthesisPhaseLabel = "Ready — press Run to synthesize",
+          flowStages = RtlToGdsFlowEngine.initialStages(),
+          flowLogLines = emptyList(),
+          physicalLayout = null,
+          simulationResult = null,
+          canResumeFlow = false,
           hasUnsavedChanges = true,
           stimulusPatterns = emptyMap(),
           customSimValues = emptyMap(),
           selectedWaveformSignals = emptySet(),
-          statusBanner = "Imported $cleanName into IDE.",
+          statusBanner = "Imported $cleanName into IDE. Press Synthesize to run flow.",
         )
       ).also(::persistDraft)
     }
-    runSynthesis()
   }
 
   // ==================== SCHEMATIC ACTIONS ====================
@@ -1082,7 +1092,6 @@ class RtlSynthViewModel(
         )
       ).also(::persistDraft)
     }
-    runSynthesis()
   }
 
   fun startBlankDesign(
@@ -1179,7 +1188,6 @@ class RtlSynthViewModel(
         )
       ).also(::persistDraft)
     }
-    runSynthesis()
   }
 
   fun loadSavedDesign(design: RtlDesign) {
@@ -1223,7 +1231,6 @@ class RtlSynthViewModel(
       ).also { updated -> persistDraft(updated, markDirty = false) }
     }
     dirtyForAutoSave = false
-    runSynthesis()
   }
 
   // ==================== SYNTHESIS & RTL-TO-GDSII EXECUTION ====================

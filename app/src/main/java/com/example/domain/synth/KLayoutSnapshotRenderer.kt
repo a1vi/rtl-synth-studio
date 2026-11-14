@@ -410,16 +410,21 @@ object KLayoutSnapshotRenderer {
     )
 
     val byLayer = parsed.flattenedPolygons.groupBy { it.layer to it.datatype }
+    val denseMode = parsed.flattenedPolygons.size > 15_000
     val rect = RectF()
     layerDrawOrder.forEach { key ->
       val list = byLayer[key].orEmpty()
       if (list.isEmpty()) return@forEach
       val (layer, dt) = key
+      val isOutlineOrDie = layer == 235 || layer == 81
       list.forEach { p ->
         val l = mapX(p.minXUm)
         val r = mapX(p.maxXUm)
         val t = mapY(p.maxYUm)
         val b = mapY(p.minYUm)
+        if (denseMode && !isOutlineOrDie && (r - l) < 0.45f && (b - t) < 0.45f && (layer == 65 || layer == 66 || layer == 67)) {
+          return@forEach
+        }
         rect.set(l, t, max(r, l + 1.5f), max(b, t + 1.5f))
 
         when {
@@ -444,13 +449,16 @@ object KLayoutSnapshotRenderer {
       }
     }
 
-    // Draw pin text labels
+    // Draw pin text labels (sub-sampled on high-pin-count SoCs to prevent text overlap)
     val pinTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
       color = Color.parseColor("#F8FAFC")
       textSize = 14f
       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
-    parsed.flattenedTexts.forEach { t ->
+    val texts = parsed.flattenedTexts
+    val textStep = (texts.size / 36).coerceAtLeast(1)
+    for (ti in texts.indices step textStep) {
+      val t = texts[ti]
       canvas.drawText(t.text, mapX(t.xUm) + 6f, mapY(t.yUm) + 5f, pinTextPaint)
     }
 

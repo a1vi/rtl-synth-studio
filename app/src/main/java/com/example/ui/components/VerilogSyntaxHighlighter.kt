@@ -73,14 +73,25 @@ class VerilogSyntaxVisualTransformation(
   }
 }
 
+data class HdlQuickFix(
+  val title: String,
+  val preview: String,
+  val patchedSource: String,
+)
+
 data class FormattedErrorSnippet(
   val lineText: String,
   val caretLine: String,
   val hint: String,
+  val suggestedFix: HdlQuickFix? = null,
 )
 
 object VerilogDiagnosticFormatter {
-  fun buildSnippet(source: String, error: VerilogParseResult.Error): FormattedErrorSnippet {
+  fun buildSnippet(
+    source: String,
+    error: VerilogParseResult.Error,
+    language: RtlLanguage = RtlLanguage.VERILOG,
+  ): FormattedErrorSnippet {
     val lines = source.split('\n')
     val lineIdx = (error.line - 1).coerceIn(0, (lines.size - 1).coerceAtLeast(0))
     val rawLine = lines.getOrElse(lineIdx) { "" }
@@ -91,11 +102,255 @@ object VerilogDiagnosticFormatter {
       }
       append('^')
     }
+    val fix = suggestQuickFix(source, lines, lineIdx, error, language)
+    val baseHint = hintFor(error.message)
+    val fullHint = if (fix != null) {
+      "$baseHint Quick fix: ${fix.title} -> `${fix.preview}`"
+    } else {
+      baseHint
+    }
     return FormattedErrorSnippet(
       lineText = rawLine,
       caretLine = caretLine,
-      hint = hintFor(error.message),
+      hint = fullHint,
+      suggestedFix = fix,
     )
+  }
+
+  fun suggestQuickFix(
+    source: String,
+    lines: List<String>,
+    errorLineIdx: Int,
+    error: VerilogParseResult.Error,
+    language: RtlLanguage = RtlLanguage.VERILOG,
+  ): HdlQuickFix? {
+    val lower = error.message.lowercase()
+
+    // 1. Empty source -> insert clean starter template matching language
+    if (source.isBlank() || "empty" in lower) {
+      val starter = when (language) {
+        RtlLanguage.VHDL -> """
+          library ieee;
+          use ieee.std_logic_1164.all;
+
+          entity rtl_top is
+            port (
+              clk : in std_logic;
+              a   : in std_logic;
+              y   : out std_logic
+            );
+          end entity;
+
+          architecture rtl of rtl_top is
+          begin
+            y <= not a;
+          end architecture;
+        """.trimIndent()
+        RtlLanguage.SYSTEM_VERILOG -> """
+          module rtl_top (
+            input  logic clk,
+            input  logic a,
+            output logic y
+          );
+            always_comb begin
+              y = ~a;
+            end
+          endmodule
+        """.trimIndent()
+        else -> """
+          module rtl_top (
+            input  wire clk,
+            input  wire a,
+            output wire y
+          );
+            assign y = ~a;
+          endmodule
+        """.trimIndent()
+      }
+      return HdlQuickFix(
+        title = "Insert ${language.badge} Starter",
+        preview = starter.lineSequence().firstOrNull().orEmpty(),
+        patchedSource = starter,
+      )
+    }
+
+    // 2. Missing semicolon ';'
+    if ("expected ';'" in lower || ("';'" in lower && "expected" in lower)) {
+      val targetIdx = findStatementLineMissingSemicolon(lines, errorLineIdx)
+      if (targetIdx != null) {
+        val updatedLine = appendSemicolonBeforeComment(lines[targetIdx], language)
+        val patched = lines.toMutableList().apply { set(targetIdx, updatedLine) }.joinToString("\n")
+        return HdlQuickFix(
+          title = "Add ';' on line ${targetIdx + 1}",
+          preview = updatedLine.trim(),
+          patchedSource = patched,
+        )
+      }
+    }
+
+    // 3. Missing 'endmodule'
+    if ("endmodule" in lower && ("missing" in lower || "expected" in lower || "found" in lower)) {
+      val trimmed = source.trimEnd()
+      val patched = "$trimmed\nendmodule\n"
+      return HdlQuickFix(
+        title = "Append 'endmodule'",
+        preview = "endmodule",
+        patchedSource = patched,
+      )
+    }
+
+    // 4. Missing 'endcase'
+    if ("expected 'endcase'" in lower) {
+      val insertAt = errorLineIdx.coerceIn(0, lines.size)
+      val indent = lines.getOrElse(insertAt) { "" }.takeWhile { it == ' ' || it == '\t' }
+      val patchedList = lines.toMutableList().apply { add(insertAt, "${indent}endcase") }
+      return HdlQuickFix(
+        title = "Insert 'endcase' at line ${insertAt + 1}",
+        preview = "${indent}endcase".trim(),
+        patchedSource = patchedList.joinToString("\n"),
+      )
+    }
+
+    // 5. Missing 'end'
+    if ("expected 'end'" in lower) {
+      val errLine = lines.getOrElse(errorLineIdx) { "" }
+      val insertAt = errorLineIdx.coerceIn(0, lines.size)
+      val indent = if (errLine.trimStart().startsWith("endmodule", ignoreCase = true)) {
+        "  "
+      } else {
+        errLine.takeWhile { it == ' ' || it == '\t' }
+      }
+      val patchedList = lines.toMutableList().apply { add(insertAt, "${indent}end") }
+      return HdlQuickFix(
+        title = "Insert 'end' at line ${insertAt + 1}",
+        preview = "${indent}end".trim(),
+        patchedSource = patchedList.joinToString("\n"),
+      )
+    }
+
+    // 6. Missing ')'
+    if ("expected ')'" in lower) {
+      val targetIdx = findUnclosedParenLine(lines, errorLineIdx)
+      if (targetIdx != null) {
+        val orig = lines[targetIdx]
+        val semiIdx = orig.indexOf(';')
+        val updated = if (semiIdx >= 0) {
+          orig.substring(0, semiIdx) + ")" + orig.substring(semiIdx)
+        } else {
+          "$orig)"
+        }
+        val patched = lines.toMutableList().apply { set(targetIdx, updated) }.joinToString("\n")
+        return HdlQuickFix(
+          title = "Close ')' on line ${targetIdx + 1}",
+          preview = updated.trim(),
+          patchedSource = patched,
+        )
+      }
+    }
+
+    // 7. Unterminated block comment /* ... */
+    if ("unterminated block comment" in lower) {
+      val patched = "${source.trimEnd()}\n*/\n"
+      return HdlQuickFix(
+        title = "Close block comment '*/'",
+        preview = "*/",
+        patchedSource = patched,
+      )
+    }
+
+    // 8. Unterminated string literal
+    if ("unterminated string" in lower) {
+      val orig = lines.getOrElse(errorLineIdx) { "" }
+      val updated = if (orig.endsWith(";")) {
+        orig.dropLast(1) + "\";"
+      } else {
+        "$orig\""
+      }
+      val patched = lines.toMutableList().apply { set(errorLineIdx, updated) }.joinToString("\n")
+      return HdlQuickFix(
+        title = "Close string literal on line ${errorLineIdx + 1}",
+        preview = updated.trim(),
+        patchedSource = patched,
+      )
+    }
+
+    // 9. Missing module declaration wrapper
+    if ("no 'module' declaration" in lower || "expected 'module'" in lower) {
+      val body = lines.joinToString("\n") { "  $it" }
+      val patched = "module rtl_top (\n  input  wire clk,\n  input  wire a,\n  output reg  y\n);\n$body\nendmodule"
+      return HdlQuickFix(
+        title = "Wrap code in 'module rtl_top'",
+        preview = "module rtl_top (...); ... endmodule",
+        patchedSource = patched,
+      )
+    }
+
+    return null
+  }
+
+  private fun findStatementLineMissingSemicolon(lines: List<String>, errorLineIdx: Int): Int? {
+    val errTrim = lines.getOrElse(errorLineIdx) { "" }.trim()
+    val startScan = if (
+      errTrim.isEmpty() ||
+      errTrim.startsWith("endmodule", ignoreCase = true) ||
+      errTrim.startsWith("endcase", ignoreCase = true) ||
+      errTrim == "end" ||
+      errTrim.startsWith("end ", ignoreCase = true) ||
+      errTrim.startsWith("else", ignoreCase = true) ||
+      errTrim.startsWith("always", ignoreCase = true) ||
+      errTrim.startsWith("assign", ignoreCase = true)
+    ) {
+      (errorLineIdx - 1).coerceAtLeast(0)
+    } else {
+      errorLineIdx
+    }
+
+    for (idx in startScan downTo 0) {
+      val raw = lines[idx]
+      val codeOnly = stripInlineComment(raw).trim()
+      if (codeOnly.isEmpty()) continue
+      val alreadyTerminated = codeOnly.endsWith(";") ||
+        codeOnly.endsWith(",") ||
+        codeOnly.endsWith("(") ||
+        codeOnly.endsWith("begin", ignoreCase = true) ||
+        codeOnly.endsWith("then", ignoreCase = true) ||
+        codeOnly.endsWith("is", ignoreCase = true) ||
+        codeOnly.endsWith(":")
+      return if (!alreadyTerminated) idx else null
+    }
+    return null
+  }
+
+  private fun findUnclosedParenLine(lines: List<String>, errorLineIdx: Int): Int? {
+    for (idx in errorLineIdx downTo maxOf(0, errorLineIdx - 4)) {
+      val code = stripInlineComment(lines[idx])
+      val opens = code.count { it == '(' }
+      val closes = code.count { it == ')' }
+      if (opens > closes) return idx
+    }
+    return null
+  }
+
+  private fun stripInlineComment(line: String): String {
+    val slIdx = line.indexOf("//")
+    val vhIdx = line.indexOf("--")
+    val cut = listOf(slIdx, vhIdx).filter { it >= 0 }.minOrNull()
+    return if (cut != null) line.substring(0, cut) else line
+  }
+
+  private fun appendSemicolonBeforeComment(line: String, language: RtlLanguage): String {
+    val commentMarker = if (language == RtlLanguage.VHDL) "--" else "//"
+    val altMarker = if (language == RtlLanguage.VHDL) "//" else "--"
+    val idx1 = line.indexOf(commentMarker).takeIf { it >= 0 }
+    val idx2 = line.indexOf(altMarker).takeIf { it >= 0 }
+    val commentIdx = listOfNotNull(idx1, idx2).minOrNull()
+    return if (commentIdx != null) {
+      val head = line.substring(0, commentIdx).trimEnd()
+      val tail = line.substring(commentIdx)
+      "$head; $tail"
+    } else {
+      "${line.trimEnd()};"
+    }
   }
 
   fun hintFor(message: String): String {
@@ -116,9 +371,11 @@ object VerilogDiagnosticFormatter {
       "no 'module' declaration" in lower ->
         "Tip: Start your RTL code with `module my_design (...);` and end with `endmodule`."
       "empty" in lower ->
-        "Tip: Enter or paste RTL source, or load an example project from Projects."
+        "Tip: Enter or paste RTL source, or tap Insert Starter to begin."
       "unterminated" in lower ->
         "Tip: Close any open string literal \"...\" or block comment /* ... */."
+      "expected identifier" in lower ->
+        "Tip: Check for a missing signal/port name or stray operator around the marked column."
       else ->
         "Tip: Check HDL syntax around the highlighted line and column marker."
     }

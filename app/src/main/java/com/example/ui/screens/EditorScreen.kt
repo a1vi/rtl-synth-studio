@@ -23,9 +23,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.rounded.AccountTree
+import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.FindReplace
 import androidx.compose.material.icons.rounded.FolderOpen
@@ -36,6 +39,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -108,6 +112,7 @@ fun EditorScreen(
   var replacementText by rememberSaveable { mutableStateOf("") }
   var showFileMenu by remember { mutableStateOf(false) }
   var pendingExportPayload by remember { mutableStateOf<String?>(null) }
+  var clearedBackup by remember(activeFile?.id) { mutableStateOf<String?>(null) }
 
   val importLauncher = rememberLauncherForActivityResult(
     contract = ActivityResultContracts.OpenDocument(),
@@ -218,6 +223,28 @@ fun EditorScreen(
       }
 
       IconButton(
+        onClick = {
+          if (activeContent.isNotEmpty()) {
+            clearedBackup = activeContent
+            onFileContentChange("")
+            onNotify("Cleared ${activeFile?.name ?: "editor"}.")
+          }
+        },
+        enabled = activeContent.isNotEmpty(),
+        modifier = Modifier.size(44.dp).testTag("editor_clear_button"),
+      ) {
+        Icon(
+          imageVector = Icons.Rounded.DeleteSweep,
+          contentDescription = "Clear editor",
+          tint = if (activeContent.isNotEmpty()) {
+            eda.warning
+          } else {
+            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+          },
+        )
+      }
+
+      IconButton(
         onClick = onSaveProject,
         modifier = Modifier.size(44.dp).testTag("editor_save_button"),
       ) {
@@ -237,6 +264,18 @@ fun EditorScreen(
             onClick = {
               showFileMenu = false
               importLauncher.launch(arrayOf("*/*"))
+            },
+          )
+          DropdownMenuItem(
+            text = { Text("Clear Active File") },
+            enabled = activeContent.isNotEmpty(),
+            onClick = {
+              showFileMenu = false
+              if (activeContent.isNotEmpty()) {
+                clearedBackup = activeContent
+                onFileContentChange("")
+                onNotify("Cleared ${activeFile?.name ?: "editor"}.")
+              }
             },
           )
           DropdownMenuItem(
@@ -381,6 +420,35 @@ fun EditorScreen(
             )
           }
 
+          val backupToRestore = clearedBackup
+          if (activeContent.isEmpty() && backupToRestore != null) {
+            Surface(
+              onClick = {
+                clearedBackup = null
+                codeFieldValue = TextFieldValue(backupToRestore, TextRange(backupToRestore.length))
+                onFileContentChange(backupToRestore)
+                onNotify("Restored cleared buffer.")
+              },
+              color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+              shape = MaterialTheme.shapes.extraSmall,
+              border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)),
+              modifier = Modifier.padding(end = 8.dp).testTag("editor_undo_clear_button"),
+            ) {
+              Row(
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+              ) {
+                Icon(Icons.AutoMirrored.Rounded.Undo, contentDescription = "Undo Clear", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(14.dp))
+                Text(
+                  text = "Undo Clear",
+                  style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                  color = MaterialTheme.colorScheme.primary,
+                )
+              }
+            }
+          }
+
           val autoSaveText = when (state.autoSaveStatus) {
             AutoSaveStatus.SAVING -> "Saving..."
             AutoSaveStatus.SAVED -> state.lastAutoSavedLabel?.let { "Auto-saved $it" } ?: "Auto-saved"
@@ -470,11 +538,11 @@ fun EditorScreen(
           )
         }
 
-        // Inline Syntax Error Diagnostic Strip (if any)
+        // Inline Syntax Error Diagnostic Strip + Smart Fix Suggestion (if any)
         val err = if (showRtlError) state.parseError else null
         if (err != null) {
-          val snippet = remember(activeContent, err) {
-            VerilogDiagnosticFormatter.buildSnippet(activeContent, err)
+          val snippet = remember(activeContent, err, activeLang) {
+            VerilogDiagnosticFormatter.buildSnippet(activeContent, err, activeLang)
           }
           Surface(
             color = eda.errorContainer,
@@ -482,25 +550,89 @@ fun EditorScreen(
               .fillMaxWidth()
               .testTag("editor_error_banner"),
           ) {
-            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = eda.error, modifier = Modifier.size(16.dp))
-                Text(
-                  text = "Syntax Error · Line ${err.line}, Col ${err.column}",
-                  style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                  color = eda.error,
-                )
+            Column(
+              modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+              verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+              Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+              ) {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(6.dp),
+                  modifier = Modifier.weight(1f),
+                ) {
+                  Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = eda.error, modifier = Modifier.size(16.dp))
+                  Text(
+                    text = "Syntax Error · Line ${err.line}, Col ${err.column}",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = eda.error,
+                  )
+                }
+                val fix = snippet.suggestedFix
+                if (fix != null) {
+                  FilledTonalButton(
+                    onClick = {
+                      codeFieldValue = TextFieldValue(fix.patchedSource, TextRange(fix.patchedSource.length))
+                      onFileContentChange(fix.patchedSource)
+                      onNotify("Applied fix: ${fix.title}")
+                    },
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                      containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f),
+                      contentColor = MaterialTheme.colorScheme.primary,
+                    ),
+                    modifier = Modifier
+                      .heightIn(min = 48.dp)
+                      .testTag("editor_apply_fix_button"),
+                  ) {
+                    Icon(Icons.Rounded.AutoFixHigh, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                      text = "Fix: ${fix.title}",
+                      style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                  }
+                }
               }
               Text(
                 text = err.message,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface,
               )
+              if (snippet.lineText.isNotBlank()) {
+                Surface(
+                  color = eda.codeSurface.copy(alpha = 0.72f),
+                  shape = MaterialTheme.shapes.extraSmall,
+                  border = BorderStroke(1.dp, eda.error.copy(alpha = 0.35f)),
+                  modifier = Modifier.fillMaxWidth(),
+                ) {
+                  Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    Text(
+                      text = snippet.lineText,
+                      style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                      color = MaterialTheme.colorScheme.onSurface,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                      text = snippet.caretLine,
+                      style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily, fontWeight = FontWeight.Bold),
+                      color = eda.error,
+                      maxLines = 1,
+                    )
+                  }
+                }
+              }
               if (snippet.hint.isNotBlank()) {
                 Text(
                   text = snippet.hint,
                   style = MaterialTheme.typography.labelSmall,
                   color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  modifier = Modifier.testTag("editor_error_suggestion_text"),
                 )
               }
             }

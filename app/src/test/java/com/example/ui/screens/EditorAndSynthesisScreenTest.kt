@@ -127,6 +127,21 @@ class EditorAndSynthesisScreenTest {
     composeTestRule.onNodeWithTag("editor_symbol_bar").assertIsDisplayed()
     composeTestRule.onNodeWithTag("symbol_key_;").performClick()
     composeTestRule.waitForIdle()
+
+    // Inject missing ';' -> suggested fix & Apply Fix button appear and fix the code
+    composeTestRule.onNodeWithTag("verilog_code_editor").performTextReplacement(invalidRtl)
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("editor_error_suggestion_text").assertIsDisplayed()
+    composeTestRule.onNodeWithTag("editor_apply_fix_button").assertIsDisplayed().performClick()
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("editor_error_banner").assertDoesNotExist()
+
+    // Clear button clears the editor and allows Undo Clear restoration
+    composeTestRule.onNodeWithTag("editor_clear_button").assertIsDisplayed().performClick()
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("editor_undo_clear_button").assertIsDisplayed().performClick()
+    composeTestRule.waitForIdle()
+    composeTestRule.onNodeWithTag("editor_error_banner").assertDoesNotExist()
   }
 
   @Test

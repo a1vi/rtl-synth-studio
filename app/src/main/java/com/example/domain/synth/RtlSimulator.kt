@@ -451,6 +451,25 @@ object RtlSimulator {
       val sliceWidth = abs(hi - lo) + 1
       maskValue(raw ushr lo, sliceWidth)
     }
+    is VerilogExpr.Index -> {
+      val baseVal = evalExpr(expr.base, env, widths)
+      val idx = evalExpr(expr.indexExpr, env, widths).toInt().coerceIn(0, 61)
+      maskValue(baseVal ushr idx, expr.width)
+    }
+    is VerilogExpr.FuncCall -> {
+      val argVals = expr.args.map { evalExpr(it, env, widths) }
+      when (expr.name.lowercase(Locale.ROOT)) {
+        "\$clog2" -> {
+          val v = (argVals.firstOrNull() ?: 0L).toInt()
+          if (v <= 1) 0L else (32 - Integer.numberOfLeadingZeros(v - 1)).toLong()
+        }
+        "\$signed", "\$unsigned" -> argVals.firstOrNull() ?: 0L
+        "\$onehot" -> if (java.lang.Long.bitCount(argVals.firstOrNull() ?: 0L) == 1) 1L else 0L
+        "\$onehot0" -> if (java.lang.Long.bitCount(argVals.firstOrNull() ?: 0L) <= 1) 1L else 0L
+        "\$countones" -> java.lang.Long.bitCount(argVals.firstOrNull() ?: 0L).toLong()
+        else -> argVals.firstOrNull() ?: 0L
+      }
+    }
     is VerilogExpr.Concat -> {
       var acc = 0L
       expr.parts.forEach { part ->
@@ -474,11 +493,15 @@ object RtlSimulator {
       val v = maskValue(evalExpr(expr.inner, env, widths), w)
       when (expr.op) {
         "~" -> maskValue(v.inv(), w)
+        "+" -> v
         "!" -> if (v == 0L) 1L else 0L
         "-" -> maskValue(-v, w)
         "&" -> if (v == maskValue(-1L, w)) 1L else 0L
+        "~&" -> if (v == maskValue(-1L, w)) 0L else 1L
         "|" -> if (v != 0L) 1L else 0L
+        "~|" -> if (v != 0L) 0L else 1L
         "^" -> (java.lang.Long.bitCount(v) % 2).toLong()
+        "~^", "^~" -> ((java.lang.Long.bitCount(v) % 2) xor 1).toLong()
         else -> v
       }
     }
@@ -490,6 +513,13 @@ object RtlSimulator {
         "+" -> maskValue(l + r, w)
         "-" -> maskValue(l - r, w)
         "*" -> maskValue(l * r, w * 2)
+        "/" -> if (r == 0L) 0L else maskValue(l / r, w)
+        "%" -> if (r == 0L) 0L else maskValue(l % r, w)
+        "**" -> {
+          var acc = 1L
+          repeat(r.toInt().coerceIn(0, 30)) { acc *= l }
+          maskValue(acc, w)
+        }
         "&" -> maskValue(l and r, w)
         "|" -> maskValue(l or r, w)
         "^" -> maskValue(l xor r, w)
@@ -498,14 +528,15 @@ object RtlSimulator {
         "^~", "~^" -> maskValue((l xor r).inv(), w)
         "&&" -> if (l != 0L && r != 0L) 1L else 0L
         "||" -> if (l != 0L || r != 0L) 1L else 0L
-        "==" -> if (l == r) 1L else 0L
-        "!=" -> if (l != r) 1L else 0L
+        "==", "===", "==?" -> if (l == r) 1L else 0L
+        "!=", "!==", "!=?" -> if (l != r) 1L else 0L
         "<" -> if (l < r) 1L else 0L
         "<=" -> if (l <= r) 1L else 0L
         ">" -> if (l > r) 1L else 0L
         ">=" -> if (l >= r) 1L else 0L
-        "<<" -> maskValue(l shl r.toInt().coerceIn(0, 62), w)
+        "<<", "<<<" -> maskValue(l shl r.toInt().coerceIn(0, 62), w)
         ">>" -> maskValue(l ushr r.toInt().coerceIn(0, 62), w)
+        ">>>" -> maskValue(l shr r.toInt().coerceIn(0, 62), w)
         else -> 0L
       }
     }
@@ -519,10 +550,12 @@ object RtlSimulator {
     is VerilogExpr.Const -> expr.width
     is VerilogExpr.Signal -> widths[expr.name] ?: 1
     is VerilogExpr.Slice -> abs(expr.msb - expr.lsb) + 1
+    is VerilogExpr.Index -> expr.width.coerceAtLeast(1)
+    is VerilogExpr.FuncCall -> 32
     is VerilogExpr.Concat -> expr.parts.sumOf { inferExprWidth(it, widths) }.coerceAtLeast(1)
     is VerilogExpr.Replication -> (expr.count * inferExprWidth(expr.inner, widths)).coerceAtLeast(1)
-    is VerilogExpr.Unary -> if (expr.op in setOf("!", "&", "|", "^")) 1 else inferExprWidth(expr.inner, widths)
-    is VerilogExpr.Binary -> if (expr.op in setOf("==", "!=", "<", "<=", ">", ">=", "&&", "||")) 1
+    is VerilogExpr.Unary -> if (expr.op in setOf("!", "&", "|", "^", "~&", "~|", "~^", "^~")) 1 else inferExprWidth(expr.inner, widths)
+    is VerilogExpr.Binary -> if (expr.op in setOf("==", "!=", "===", "!==", "==?", "!=?", "<", "<=", ">", ">=", "&&", "||")) 1
     else maxOf(inferExprWidth(expr.left, widths), inferExprWidth(expr.right, widths))
     is VerilogExpr.Ternary -> maxOf(inferExprWidth(expr.thenExpr, widths), inferExprWidth(expr.elseExpr, widths))
   }

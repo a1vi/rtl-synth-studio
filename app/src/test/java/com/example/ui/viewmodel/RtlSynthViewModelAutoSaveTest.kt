@@ -60,10 +60,15 @@ class RtlSynthViewModelAutoSaveTest {
         )
         vmStore.put("vm", vm)
 
-        // Allow initial parse + synthesis to run without user edits
+        // Startup should parse live code cleanly WITHOUT auto-running synthesis
         advanceTimeBy(4_000L)
         runCurrent()
         assertEquals(AutoSaveStatus.IDLE, vm.workbench.value.autoSaveStatus)
+        assertEquals(null, vm.workbench.value.synthesisResult)
+        assertEquals(null, vm.workbench.value.physicalLayout)
+        assertEquals(null, vm.workbench.value.simulationResult)
+        assertEquals(0f, vm.workbench.value.synthesisProgress, 0.001f)
+        assertTrue(localStore.localRuns.value.isEmpty())
 
         // Make an RTL edit -> debounced auto-save fires after 1.5s
         fakeClockMs += 60_000L

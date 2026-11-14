@@ -308,27 +308,35 @@ object RtlSynthesisEngine {
     private val warnings: MutableList<String>,
   ) {
     private val nodes = mutableListOf<GateNode>()
+    private val idToNodeIndex = HashMap<String, Int>()
     private val netToNodeId = mutableMapOf<String, String>()
     private val exprCache = mutableMapOf<String, String>()
     private var instCounter = 0
     private var wireCounter = 0
     private var rawOps = 0
 
+    private fun recordNode(node: GateNode) {
+      idToNodeIndex[node.id] = nodes.size
+      nodes += node
+    }
+
     fun elaborate(): IrGraph {
       module.ports.filter { it.direction == PortDirection.INPUT || it.direction == PortDirection.INOUT }
         .forEach { port ->
           val id = "in_${port.name}"
-          nodes += GateNode(
-            id = id,
-            cellName = "INPUT",
-            gateType = GateType.INPUT_PORT,
-            instanceName = port.name,
-            inputs = emptyList(),
-            outputNet = port.name,
-            bitWidth = port.width,
-            delayNs = 0.0,
-            areaUm2 = 0.0,
-            powerUw = 0.0,
+          recordNode(
+            GateNode(
+              id = id,
+              cellName = "INPUT",
+              gateType = GateType.INPUT_PORT,
+              instanceName = port.name,
+              inputs = emptyList(),
+              outputNet = port.name,
+              bitWidth = port.width,
+              delayNs = 0.0,
+              areaUm2 = 0.0,
+              powerUw = 0.0,
+            )
           )
           netToNodeId[port.name] = id
         }
@@ -376,18 +384,20 @@ object RtlSynthesisEngine {
           if (resetVal != null && resetVal !is VerilogExpr.Const) {
             inputs += lowerExpr(resetVal, width)
           }
-          val dffId = "reg_$target"
-          nodes += GateNode(
-            id = dffId,
-            cellName = if (hasReset) "DFFR" else "DFF",
-            gateType = if (hasReset) GateType.DFFR else GateType.DFF,
-            instanceName = "u_reg_$target",
-            inputs = inputs.distinct(),
-            outputNet = target,
-            bitWidth = width,
-            delayNs = 0.0,
-            areaUm2 = 0.0,
-            powerUw = 0.0,
+          val dffId = if (!idToNodeIndex.containsKey("reg_$target")) "reg_$target" else "reg_${target}_${instCounter++}"
+          recordNode(
+            GateNode(
+              id = dffId,
+              cellName = if (hasReset) "DFFR" else "DFF",
+              gateType = if (hasReset) GateType.DFFR else GateType.DFF,
+              instanceName = "u_reg_$target",
+              inputs = inputs.distinct(),
+              outputNet = target,
+              bitWidth = width,
+              delayNs = 0.0,
+              areaUm2 = 0.0,
+              powerUw = 0.0,
+            )
           )
           netToNodeId[target] = dffId
         }
@@ -398,12 +408,17 @@ object RtlSynthesisEngine {
         val subMod = design.modules.firstOrNull { it.name == inst.moduleType }
         val inNets = mutableListOf<String>()
         val outNets = mutableListOf<String>()
-        if (subMod != null && inst.portConnections.isNotEmpty()) {
-          subMod.ports.forEach { p ->
-            val conn = inst.portConnections[p.name]
+        if (subMod != null && (inst.portConnections.isNotEmpty() || inst.positionalConnections.isNotEmpty())) {
+          subMod.ports.forEachIndexed { idx, p ->
+            val conn = if (inst.portConnections.isNotEmpty()) {
+              inst.portConnections[p.name]
+            } else {
+              inst.positionalConnections.getOrNull(idx)
+            }
             if (conn != null) {
               if (p.direction == PortDirection.OUTPUT) {
                 if (conn is VerilogExpr.Signal) outNets += conn.name
+                else if (conn is VerilogExpr.Slice) outNets += conn.name
               } else {
                 inNets += lowerExpr(conn, p.width)
               }
@@ -413,14 +428,28 @@ object RtlSynthesisEngine {
           inst.portConnections.values.forEach { expr -> inNets += lowerExpr(expr, 1) }
           inst.positionalConnections.forEach { expr -> inNets += lowerExpr(expr, 1) }
         }
-        val targetNet = outNets.firstOrNull() ?: "${inst.instanceName}_out"
-        emitGate(
-          type = GateType.BUF,
-          inputs = inNets.distinct(),
-          outputNet = targetNet,
-          width = module.signalWidth(targetNet),
-          customLabel = inst.moduleType.uppercase(Locale.ROOT),
-        )
+        val cleanInNets = inNets.distinct()
+        if (outNets.isEmpty()) {
+          val targetNet = "${inst.instanceName}_out"
+          emitGate(
+            type = GateType.BUF,
+            inputs = cleanInNets,
+            outputNet = targetNet,
+            width = module.signalWidth(targetNet),
+            customLabel = inst.moduleType.uppercase(Locale.ROOT),
+          )
+        } else {
+          outNets.distinct().forEachIndexed { oIdx, targetNet ->
+            val suffixLabel = if (oIdx == 0) inst.moduleType.uppercase(Locale.ROOT) else "${inst.moduleType.uppercase(Locale.ROOT)}_$oIdx"
+            emitGate(
+              type = GateType.BUF,
+              inputs = cleanInNets,
+              outputNet = targetNet,
+              width = module.signalWidth(targetNet),
+              customLabel = suffixLabel,
+            )
+          }
+        }
       }
 
       module.ports.filter { it.direction == PortDirection.OUTPUT }
@@ -429,17 +458,19 @@ object RtlSynthesisEngine {
           if (netToNodeId[port.name] == null) {
             warnings += "Output port '${port.name}' has no driver; tied to logic 0."
           }
-          nodes += GateNode(
-            id = id,
-            cellName = "OUTPUT",
-            gateType = GateType.OUTPUT_PORT,
-            instanceName = port.name,
-            inputs = listOf(port.name),
-            outputNet = port.name,
-            bitWidth = port.width,
-            delayNs = 0.0,
-            areaUm2 = 0.0,
-            powerUw = 0.0,
+          recordNode(
+            GateNode(
+              id = id,
+              cellName = "OUTPUT",
+              gateType = GateType.OUTPUT_PORT,
+              instanceName = port.name,
+              inputs = listOf(port.name),
+              outputNet = port.name,
+              bitWidth = port.width,
+              delayNs = 0.0,
+              areaUm2 = 0.0,
+              powerUw = 0.0,
+            )
           )
         }
 
@@ -521,9 +552,9 @@ object RtlSynthesisEngine {
     private fun addBufferOrAlias(target: String, srcNet: String, width: Int) {
       if (srcNet == target) return
       val existingDriver = netToNodeId[srcNet]
-      val existingNode = nodes.firstOrNull { it.id == existingDriver }
+      val idx = existingDriver?.let { idToNodeIndex[it] }
+      val existingNode = idx?.let { nodes.getOrNull(it) }
       if (existingNode != null && !existingNode.gateType.isPort && !existingNode.gateType.isSequential && existingNode.outputNet.startsWith("_n")) {
-        val idx = nodes.indexOf(existingNode)
         nodes[idx] = existingNode.copy(outputNet = target)
         netToNodeId.remove(srcNet)
         netToNodeId[target] = existingNode.id
@@ -550,10 +581,47 @@ object RtlSynthesisEngine {
         is VerilogExpr.Signal -> expr.name
         is VerilogExpr.Slice -> {
           val w = max(1, abs(expr.msb - expr.lsb) + 1)
-          val net = "_slice_${expr.name}_${expr.msb}_${expr.lsb}"
-          if (!netToNodeId.containsKey(net)) {
-            emitGate(GateType.BUF, listOf(expr.name), net, w)
+          val dynIdx = expr.msbExpr?.takeIf { it !is VerilogExpr.Const }
+          if (dynIdx != null) {
+            val idxNet = lowerExpr(dynIdx, 8)
+            val key = "DYNSLICE_${expr.name}_${idxNet}"
+            if (exprCache.containsKey(key)) return exprCache[key]!!
+            val net = newWire()
+            emitGate(GateType.MUX2, listOf(idxNet, expr.name, expr.name), net, w)
+            exprCache[key] = net
+            net
+          } else {
+            val net = "_slice_${expr.name}_${expr.msb}_${expr.lsb}"
+            if (!netToNodeId.containsKey(net)) {
+              emitGate(GateType.BUF, listOf(expr.name), net, w)
+            }
+            net
           }
+        }
+        is VerilogExpr.Index -> {
+          val baseNet = lowerExpr(expr.base, widthHint)
+          val idxNet = lowerExpr(expr.indexExpr, 8)
+          val key = "IDX_${baseNet}_${idxNet}"
+          if (exprCache.containsKey(key)) return exprCache[key]!!
+          val net = newWire()
+          emitGate(GateType.MUX2, listOf(idxNet, baseNet, baseNet), net, max(widthHint, expr.width))
+          exprCache[key] = net
+          net
+        }
+        is VerilogExpr.FuncCall -> {
+          if (expr.name.equals("\$clog2", ignoreCase = true) && expr.args.firstOrNull() is VerilogExpr.Const) {
+            val v = (expr.args.first() as VerilogExpr.Const).value
+            val lg = if (v <= 1) 0 else 32 - Integer.numberOfLeadingZeros(v - 1)
+            return lowerExpr(VerilogExpr.Const(lg, 32), widthHint)
+          }
+          val argNets = expr.args.map { lowerExpr(it, widthHint) }.distinct()
+          val net = newWire()
+          emitGate(
+            type = if (argNets.size >= 2) GateType.AND2 else GateType.BUF,
+            inputs = argNets.ifEmpty { listOf("1'b0") },
+            outputNet = net,
+            width = widthHint,
+          )
           net
         }
         is VerilogExpr.Concat -> {
@@ -573,14 +641,15 @@ object RtlSynthesisEngine {
         }
         is VerilogExpr.Unary -> {
           val inner = lowerExpr(expr.inner, widthHint)
+          if (expr.op == "+") return inner
           val gate = when (expr.op) {
             "~", "!", "-" -> GateType.INV
-            "&" -> GateType.AND2
-            "|" -> GateType.OR2
-            "^" -> GateType.XOR2
+            "&", "~&" -> GateType.AND2
+            "|", "~|" -> GateType.OR2
+            "^", "~^", "^~" -> GateType.XOR2
             else -> GateType.INV
           }
-          val key = "${gate.name}_$inner"
+          val key = "${gate.name}_${expr.op}_$inner"
           if (goal != OptimizationGoal.MIN_DELAY && exprCache.containsKey(key)) return exprCache[key]!!
           val net = newWire()
           emitGate(gate, listOf(inner), net, widthHint)
@@ -592,6 +661,7 @@ object RtlSynthesisEngine {
             val folded = when (expr.op) {
               "+" -> expr.left.value + expr.right.value
               "-" -> expr.left.value - expr.right.value
+              "*" -> expr.left.value * expr.right.value
               "&" -> expr.left.value and expr.right.value
               "|" -> expr.left.value or expr.right.value
               "^" -> expr.left.value xor expr.right.value
@@ -612,9 +682,9 @@ object RtlSynthesisEngine {
             "^~", "~^" -> GateType.XOR2
             "+" -> GateType.ADD_CELL
             "-" -> GateType.SUB_CELL
-            "*" -> GateType.MUL_CELL
-            "==", "!=", "<", "<=", ">", ">=" -> GateType.CMP_CELL
-            "<<", ">>" -> GateType.BUF
+            "*", "/", "%", "**" -> GateType.MUL_CELL
+            "==", "!=", "===", "!==", "==?", "!=?", "<", "<=", ">", ">=" -> GateType.CMP_CELL
+            "<<", ">>", "<<<", ">>>" -> GateType.BUF
             else -> GateType.AND2
           }
           val key = "${gate.name}_${lNet}_${rNet}"
@@ -648,17 +718,19 @@ object RtlSynthesisEngine {
       customLabel: String? = null,
     ): String {
       val id = "g_${++instCounter}"
-      nodes += GateNode(
-        id = id,
-        cellName = customLabel ?: type.shortLabel,
-        gateType = type,
-        instanceName = "u_${type.shortLabel.lowercase(Locale.ROOT)}_$instCounter",
-        inputs = inputs,
-        outputNet = outputNet,
-        bitWidth = width,
-        delayNs = 0.0,
-        areaUm2 = 0.0,
-        powerUw = 0.0,
+      recordNode(
+        GateNode(
+          id = id,
+          cellName = customLabel ?: type.shortLabel,
+          gateType = type,
+          instanceName = "u_${type.shortLabel.lowercase(Locale.ROOT)}_$instCounter",
+          inputs = inputs,
+          outputNet = outputNet,
+          bitWidth = width,
+          delayNs = 0.0,
+          areaUm2 = 0.0,
+          powerUw = 0.0,
+        )
       )
       netToNodeId[outputNet] = id
       return id
@@ -893,6 +965,7 @@ object RtlSynthesisEngine {
       val toNode = nodeMap[edge.toNodeId]
       toNode != null && !toNode.gateType.isSequential
     }
+    val combOutgoing = combEdges.groupBy { it.fromNodeId }
 
     val combInDegree = nodes.associate { it.id to 0 }.toMutableMap()
     combEdges.forEach { e -> combInDegree[e.toNodeId] = (combInDegree[e.toNodeId] ?: 0) + 1 }
@@ -902,18 +975,21 @@ object RtlSynthesisEngine {
       if ((combInDegree[n.id] ?: 0) == 0) queue.addLast(n.id)
     }
 
-    val topoOrder = mutableListOf<String>()
+    val topoOrder = ArrayList<String>(nodes.size)
+    val inTopo = HashSet<String>(nodes.size * 2)
     while (queue.isNotEmpty()) {
       val curr = queue.removeFirst()
-      topoOrder += curr
-      combEdges.filter { it.fromNodeId == curr }.forEach { edge ->
+      if (inTopo.add(curr)) {
+        topoOrder += curr
+      }
+      (combOutgoing[curr] ?: emptyList()).forEach { edge ->
         val next = edge.toNodeId
         val rem = (combInDegree[next] ?: 0) - 1
         combInDegree[next] = rem
         if (rem == 0) queue.addLast(next)
       }
     }
-    nodes.forEach { if (it.id !in topoOrder) topoOrder += it.id }
+    nodes.forEach { if (inTopo.add(it.id)) topoOrder += it.id }
 
     val levelMap = mutableMapOf<String, Int>()
     val arrivalMap = mutableMapOf<String, Double>()
