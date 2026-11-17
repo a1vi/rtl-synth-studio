@@ -84,9 +84,9 @@ private val DarkColorScheme =
     surfaceContainerLow = IndustrialBgDark,
     surfaceContainer = IndustrialSurfaceDark,
     surfaceContainerHigh = IndustrialCardDark,
-    surfaceContainerHighest = Color(0xFF1E293B),
+    surfaceContainerHighest = Color(0xFF282E36),
     outline = IndustrialOutlineDark,
-    outlineVariant = IndustrialOutlineDark.copy(alpha = 0.65f),
+    outlineVariant = IndustrialOutlineDark.copy(alpha = 0.72f),
     error = RedErrorDark,
     onError = ElectricBlueOnDark,
     errorContainer = RedContainerDark,
@@ -127,11 +127,11 @@ private val LightColorScheme =
   )
 
 val IndustrialShapes = Shapes(
-  extraSmall = RoundedCornerShape(6.dp),
-  small = RoundedCornerShape(8.dp),
-  medium = RoundedCornerShape(12.dp),
-  large = RoundedCornerShape(14.dp),
-  extraLarge = RoundedCornerShape(18.dp),
+  extraSmall = RoundedCornerShape(3.dp),
+  small = RoundedCornerShape(4.dp),
+  medium = RoundedCornerShape(6.dp),
+  large = RoundedCornerShape(8.dp),
+  extraLarge = RoundedCornerShape(10.dp),
 )
 
 @Composable

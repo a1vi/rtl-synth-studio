@@ -12,7 +12,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import com.example.domain.synth.PresetRtlDesigns
+import com.example.domain.synth.TestRtlFixtures
 import com.example.domain.synth.RtlSimulator
 import com.example.domain.synth.StimulusPattern
 import com.example.domain.synth.VerilogHdlParser
@@ -34,7 +34,7 @@ class SimulationScreenTest {
 
   @Test
   fun simulationScreen_switchesRadixStepsCyclesAndOverridesStimulus() {
-    val preset = PresetRtlDesigns.templates.first { it.name == "counter_8bit" }
+    val preset = TestRtlFixtures.counter8Bit
     val design = (VerilogHdlParser.parse(preset.verilogCode) as VerilogParseResult.Success).design
 
     composeTestRule.setContent {
@@ -80,15 +80,15 @@ class SimulationScreenTest {
     // Switch radix to BIN and verify binary width formatting
     composeTestRule.onNodeWithTag("sim_radix_bin").performClick()
     composeTestRule.waitForIdle()
-    composeTestRule.onNodeWithText("00000000").assertIsDisplayed()
+    composeTestRule.onNodeWithText("00000000").performScrollTo().assertIsDisplayed()
 
     // Change cycle depth to 8c
-    composeTestRule.onNodeWithTag("sim_cycles_8").performClick()
+    composeTestRule.onNodeWithTag("sim_cycles_8").performScrollTo().performClick()
     composeTestRule.waitForIdle()
     composeTestRule.onNodeWithText("counter_8bit · 8 cycles · clk=clk").assertIsDisplayed()
 
     // Cycle stimulus pattern on 'en'
-    composeTestRule.onNodeWithTag("stim_pattern_en").performClick()
+    composeTestRule.onNodeWithTag("stim_pattern_en").performScrollTo().performClick()
     composeTestRule.waitForIdle()
     composeTestRule.onNodeWithText("en: Count").assertIsDisplayed()
 

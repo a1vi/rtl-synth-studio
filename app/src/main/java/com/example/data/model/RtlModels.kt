@@ -167,6 +167,7 @@ data class AppSettings(
   val defaultEngine: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
   val aggressiveOptimization: Boolean = false,
   val retainHierarchy: Boolean = true,
+  val bitBlastGates: Boolean = false,
   val defaultLibrary: TargetLibrary = TargetLibrary.ASAP7_7NM,
   val localBridgeEnabled: Boolean = false,
   val localBridgeEndpoint: String = "http://127.0.0.1:8765",

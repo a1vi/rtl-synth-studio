@@ -172,6 +172,7 @@ object VerilogHdlParser {
           stmt.branches.forEach { (_, body) -> collectAssignedNames(body, out) }
           collectAssignedNames(stmt.defaultBranch, out)
         }
+        is VerilogStmt.Display, is VerilogStmt.AssertStmt -> Unit
       }
     }
   }
@@ -1028,6 +1029,7 @@ object VerilogHdlParser {
             }
             cur = acc
           }
+          is VerilogStmt.Display, is VerilogStmt.AssertStmt -> Unit
         }
       }
       return cur
@@ -1199,6 +1201,9 @@ object VerilogHdlParser {
     private fun parseModuleInstance(params: Map<String, Int>): VerilogModuleInstance {
       val modTypeTok = expectIdent()
       val paramOverrides = linkedMapOf<String, Int>()
+      val positionalParamOverrides = mutableListOf<Int>()
+      val symbolicParamOverrides = linkedMapOf<String, VerilogExpr>()
+      val symbolicPositionalParamOverrides = mutableListOf<VerilogExpr>()
       if (match("#")) {
         expect("(")
         while (peek().text != ")" && peek().type != TokenType.EOF) {
@@ -1209,12 +1214,16 @@ object VerilogHdlParser {
               if (peek().text in svTypeKeywords || peek().text == "type") {
                 skipBalancedUntil(setOf(")"))
               } else {
-                paramOverrides[pName] = evalConstInt(parseExpr(params), params)
+                val expr = parseExpr(emptyMap())
+                symbolicParamOverrides[pName] = expr
+                paramOverrides[pName] = evalConstInt(expr, params)
               }
             }
             expect(")")
           } else {
-            parseExpr(params)
+            val expr = parseExpr(emptyMap())
+            symbolicPositionalParamOverrides += expr
+            positionalParamOverrides += evalConstInt(expr, params)
           }
           if (!match(",")) break
         }
@@ -1254,6 +1263,9 @@ object VerilogHdlParser {
         positionalConnections = positional,
         line = modTypeTok.line,
         paramOverrides = paramOverrides,
+        positionalParamOverrides = positionalParamOverrides,
+        symbolicParamOverrides = symbolicParamOverrides,
+        symbolicPositionalParamOverrides = symbolicPositionalParamOverrides,
       )
     }
 
@@ -1356,6 +1368,7 @@ object VerilogHdlParser {
     private fun parseAlwaysBlock(params: Map<String, Int>): VerilogAlwaysBlock {
       val kwTok = consume()
       var isSeq = kwTok.text == "always_ff"
+      var isStarSensitivity = kwTok.text == "always_comb"
       var clockName: String? = null
       var resetName: String? = null
       var resetActiveLow = false
@@ -1364,10 +1377,12 @@ object VerilogHdlParser {
       if (match("@")) {
         if (match("*")) {
           isSeq = false
+          isStarSensitivity = true
         } else {
           expect("(")
           if (match("*")) {
             isSeq = false
+            isStarSensitivity = true
           } else {
             while (peek().text != ")" && peek().type != TokenType.EOF) {
               when (peek().text) {
@@ -1411,6 +1426,8 @@ object VerilogHdlParser {
         sensitivitySignals = sensSignals.distinct(),
         statements = stmts,
         line = kwTok.line,
+        alwaysKind = kwTok.text,
+        hasStarSensitivity = isStarSensitivity,
       )
     }
 
@@ -1507,26 +1524,69 @@ object VerilogHdlParser {
           emptyList()
         }
         "assert", "assume", "cover" -> {
-          consume()
+          val kwTok = consume()
+          val isAssert = kwTok.text == "assert"
           match("property") || match("final")
           if (match("#")) {
             if (peek().type == TokenType.NUMBER || peek().type == TokenType.IDENT) consume()
           }
-          if (peek().text == "(") skipParenGroup()
+          val condExpr: VerilogExpr? = if (isAssert && peek().text == "(") {
+            val savedPos = pos
+            try {
+              expect("(")
+              val expr = parseExpr(params)
+              expect(")")
+              expr
+            } catch (_: ParseException) {
+              pos = savedPos
+              skipParenGroup()
+              null
+            }
+          } else {
+            if (peek().text == "(") skipParenGroup()
+            null
+          }
           if (match("else")) parseStmtOrBlock(params) else match(";")
-          emptyList()
+          if (condExpr != null) {
+            listOf(VerilogStmt.AssertStmt(condExpr, "assert(line ${kwTok.line})", kwTok.line))
+          } else {
+            emptyList()
+          }
         }
         "disable" -> {
           skipUntilSemicolon()
           emptyList()
         }
         else -> {
-          // Ignore non-synthesizable PLI/system calls `$display`, `$finish`, etc.
+          // Capture `$display`/`$write`/`$info`/`$strobe` for simulation console; skip other PLI calls
           if (t.type == TokenType.IDENT && t.text.startsWith("$")) {
-            consume()
-            if (peek().text == "(") skipParenGroup()
-            match(";")
-            return emptyList()
+            val callTok = consume()
+            val fnLower = callTok.text.lowercase()
+            if (fnLower in setOf("\$display", "\$write", "\$info", "\$strobe") && peek().text == "(") {
+              val savedPos = pos
+              val parsedDisplay = try {
+                expect("(")
+                val fmt = if (peek().type == TokenType.STRING) consume().text.removeSurrounding("\"") else ""
+                val args = mutableListOf<VerilogExpr>()
+                while (match(",")) {
+                  if (peek().text != ")" && peek().type != TokenType.EOF) {
+                    args += parseExpr(params)
+                  }
+                }
+                expect(")")
+                VerilogStmt.Display(fmt, args, callTok.line)
+              } catch (_: ParseException) {
+                pos = savedPos
+                skipParenGroup()
+                null
+              }
+              match(";")
+              return if (parsedDisplay != null) listOf(parsedDisplay) else emptyList()
+            } else {
+              if (peek().text == "(") skipParenGroup()
+              match(";")
+              return emptyList()
+            }
           }
           val line = t.line
           val lhsTerms = parseLhsTargets(params)
@@ -2108,6 +2168,12 @@ object VerilogHdlParser {
           },
           defaultBranch = stmt.defaultBranch.map { substituteLoopStmt(it, varName, value, params) },
           line = stmt.line,
+        )
+        is VerilogStmt.Display -> stmt.copy(
+          args = stmt.args.map { substituteLoopExpr(it, varName, value, params) },
+        )
+        is VerilogStmt.AssertStmt -> stmt.copy(
+          cond = substituteLoopExpr(stmt.cond, varName, value, params),
         )
       }
     }

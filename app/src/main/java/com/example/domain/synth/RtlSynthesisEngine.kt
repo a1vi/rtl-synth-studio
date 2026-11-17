@@ -25,6 +25,8 @@ object RtlSynthesisEngine {
     topModuleName: String? = null,
     sdcText: String = "",
     engineProfile: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
+    bitBlast: Boolean = false,
+    dftConfig: DftConfig = DftConfig(),
   ): SynthesisResult {
     val startedNs = System.nanoTime()
     val log = mutableListOf<String>()
@@ -71,6 +73,19 @@ object RtlSynthesisEngine {
       log += "[00.02s] Applied SDC constraints: ${sdcSet.summaryLine()}"
     }
 
+    val rtlDrcReport = RtlDesignRuleChecker.checkDesign(parsedDesign, effectiveSource)
+    log += "[DRC] Pre-Synthesis RTL DRC (${rtlDrcReport.rulesEvaluated} rules): ${rtlDrcReport.summaryBadgeText()} (${rtlDrcReport.scanDurationMs} ms)"
+    rtlDrcReport.violations.forEach { v ->
+      val lineNote = if (v.line > 0) "Line ${v.line}: " else ""
+      if (v.severity == RtlDrcSeverity.ERROR) {
+        log += "[WARN] [${v.ruleId}] ${v.moduleName} $lineNote${v.title} — ${v.message}"
+        warnings += "[${v.ruleId}] $lineNote${v.message}"
+      } else if (v.severity == RtlDrcSeverity.WARNING) {
+        log += "[WARN] [${v.ruleId}] ${v.moduleName} $lineNote${v.title} — ${v.message}"
+        warnings += "[${v.ruleId}] $lineNote${v.message}"
+      }
+    }
+
     val effectiveGoal = when (engineProfile) {
       SynthesisEngineProfile.YOSYS_ABC ->
         if (goal == OptimizationGoal.BALANCED) OptimizationGoal.MIN_DELAY else goal
@@ -79,16 +94,26 @@ object RtlSynthesisEngine {
       SynthesisEngineProfile.SILICON_FLOW -> goal
     }
 
-    log += "[00.03s] Phase 2: RTL elaboration & logic optimization (${effectiveGoal.displayName})..."
-    val elaborator = Elaborator(parsedDesign, moduleAst, effectiveGoal, warnings)
+    val modeTag = if (bitBlast) "${effectiveGoal.displayName}, Bit-Blasted" else effectiveGoal.displayName
+    log += "[00.03s] Phase 2: RTL elaboration & logic optimization ($modeTag)..."
+    val elaborator = Elaborator(parsedDesign, moduleAst, effectiveGoal, warnings, bitBlast)
     val irGraph = elaborator.elaborate()
     val preOptCount = (irGraph.rawOps * 1.18).toInt().coerceAtLeast(irGraph.nodes.count { !it.gateType.isPort })
-    log += "[00.05s] Elaborated ${irGraph.rawOps} RTL operators -> ${irGraph.nodes.count { !it.gateType.isPort }} optimized IR cells"
+    log += "[00.05s] Elaborated ${irGraph.rawOps} RTL operators (flattened ${irGraph.flattenedInstances} instance(s)) -> ${irGraph.nodes.count { !it.gateType.isPort }} optimized IR cells"
 
     log += "[00.06s] Phase 3: Technology mapping to ${library.shortName} (${engineProfile.shortName})..."
     val mapper = TechMapper(library, effectiveGoal, engineProfile)
-    val mappedNodes = mapper.mapNodes(irGraph.nodes)
-    log += "[00.08s] Mapped ${mappedNodes.count { !it.gateType.isPort }} physical primitives"
+    val baseMappedNodes = mapper.mapNodes(irGraph.nodes)
+    log += "[00.08s] Mapped ${baseMappedNodes.count { !it.gateType.isPort }} physical primitives"
+
+    val scanOutcome = DftEngine.applyScanInsertion(
+      ports = moduleAst.ports,
+      mappedNodes = baseMappedNodes,
+      library = library,
+      config = dftConfig,
+      warnings = warnings,
+      log = log,
+    )
 
     log += "[00.09s] Phase 4: Static Timing Analysis @ ${formatNum(safeClockNs)} ns (${formatNum(1000.0 / safeClockNs)} MHz)..."
 
@@ -96,17 +121,20 @@ object RtlSynthesisEngine {
     return SynthesisResult.Success(
       buildReportFromMappedNodes(
         moduleName = moduleAst.name,
-        ports = moduleAst.ports,
+        ports = scanOutcome.ports,
         library = library,
         goal = goal,
         safeClockNs = safeClockNs,
-        mappedNodes = mappedNodes,
+        mappedNodes = scanOutcome.nodes,
         log = log,
         warnings = warnings,
         sdcSet = sdcSet,
         durationMs = elapsedMs,
         preOptCellCount = preOptCount,
         engineProfile = engineProfile,
+        dftConfig = dftConfig,
+        scanOutcome = scanOutcome,
+        rtlDrcReport = rtlDrcReport,
       )
     )
   }
@@ -216,31 +244,46 @@ object RtlSynthesisEngine {
     durationMs: Long = 1L,
     preOptCellCount: Int = 0,
     engineProfile: SynthesisEngineProfile = SynthesisEngineProfile.SILICON_FLOW,
+    dftConfig: DftConfig = DftConfig(),
+    scanOutcome: ScanInsertionOutcome? = null,
+    rtlDrcReport: RtlDrcReport? = null,
   ): SynthesisReport {
     val allWarnings = warnings.toMutableList()
     val edges = buildEdges(mappedNodes)
-    val timedResult = runStaticTimingAnalysis(mappedNodes, edges, safeClockNs, sdcSet)
+    val timedResult = runStaticTimingAnalysis(mappedNodes, edges, safeClockNs, sdcSet, library)
 
     val nonPortNodes = timedResult.nodes.filter { !it.gateType.isPort }
     val combCount = nonPortNodes.count { !it.gateType.isSequential }
     val seqCount = nonPortNodes.count { it.gateType.isSequential }
     val totalArea = nonPortNodes.sumOf { it.areaUm2 }
-    val dynamicPowerMw = nonPortNodes.sumOf { it.powerUw } * (1000.0 / safeClockNs / 250.0).coerceIn(0.4, 3.5) / 1000.0
-    val leakagePowerMw = nonPortNodes.sumOf { it.powerUw } * 0.14 / 1000.0
-    val totalPowerMw = dynamicPowerMw + leakagePowerMw
+    val powerReport = PowerAnalysisEngine.analyze(
+      moduleName = moduleName,
+      ports = ports,
+      nodes = timedResult.nodes,
+      edges = timedResult.edges,
+      library = library,
+      clockPeriodNs = safeClockNs,
+      simulation = null,
+    )
+    val switchingPowerMw = powerReport.switchingPowerMw
+    val internalPowerMw = powerReport.internalPowerMw
+    val dynamicPowerMw = powerReport.dynamicPowerMw
+    val leakagePowerMw = powerReport.leakagePowerMw
+    val totalPowerMw = powerReport.totalPowerMw
 
     val histogram = nonPortNodes.groupingBy { it.gateType.shortLabel }.eachCount()
       .entries.sortedByDescending { it.value }
       .associate { it.key to it.value }
 
-    val fmaxMhz = if (timedResult.criticalDelayNs > 0.001) {
+    val fmaxMhz = if (timedResult.criticalPath.isNotEmpty() && timedResult.criticalDelayNs > 0.001) {
       1000.0 / timedResult.criticalDelayNs
     } else {
-      1000.0 / safeClockNs
+      0.0
     }
 
-    log += "[00.11s] STA complete: Critical Path = ${formatNum(timedResult.criticalDelayNs)} ns, WNS = ${formatSigned(timedResult.wnsNs)} ns, Fmax = ${formatNum(fmaxMhz)} MHz"
-    log += "[00.12s] Area = ${formatNum(totalArea)} um^2 | Cells = ${nonPortNodes.size} (Comb: $combCount, Seq: $seqCount) | Power = ${formatNum(totalPowerMw)} mW"
+    val fmaxLabel = if (fmaxMhz > 0.0) "${formatNum(fmaxMhz)} MHz" else "N/A (no constrained path)"
+    log += "[00.11s] STA complete: Critical Path = ${formatNum(timedResult.criticalDelayNs)} ns, WNS = ${formatSigned(timedResult.wnsNs)} ns, Fmax = $fmaxLabel"
+    log += "[00.12s] Area = ${formatNum(totalArea)} um^2 | Cells = ${nonPortNodes.size} (Comb: $combCount, Seq: $seqCount) | Power = ${formatNum(totalPowerMw)} mW (Sw: ${formatNum(switchingPowerMw)}, Int: ${formatNum(internalPowerMw)}, Leak: ${formatNum(leakagePowerMw)})"
 
     if (timedResult.wnsNs < 0.0) {
       allWarnings += "Timing violation: WNS is ${formatSigned(timedResult.wnsNs)} ns. Consider Min Delay optimization or relaxing clock period."
@@ -257,7 +300,31 @@ object RtlSynthesisEngine {
 
     val avgInDelay = sdcSet.ioDelays.filter { it.isInput }.map { it.delayNs }.maxOrNull() ?: 0.0
     val avgOutDelay = sdcSet.ioDelays.filter { !it.isInput }.map { it.delayNs }.maxOrNull() ?: 0.0
+    val maxOutLoadPf = sdcSet.outputLoads.maxOfOrNull { it.loadPf } ?: 0.0
     val fpCount = timedResult.nodes.count { it.isFalsePath }
+
+    val effectiveScanOutcome = scanOutcome ?: ScanInsertionOutcome(
+      ports = ports,
+      nodes = timedResult.nodes,
+      scanChains = emptyList(),
+      lockupLatchCount = timedResult.nodes.count { it.gateType == GateType.LOCKUP_LATCH },
+      jtagTapInserted = false,
+      mbistCollarInserted = false,
+      scanAreaOverheadUm2 = 0.0,
+      scanInsertedCount = timedResult.nodes.count { it.gateType == GateType.SDFF || it.gateType == GateType.SDFFR },
+    )
+    val dftReport = DftEngine.analyzeAndGenerateAtpg(
+      moduleName = moduleName,
+      ports = ports,
+      nodes = timedResult.nodes,
+      edges = timedResult.edges,
+      library = library,
+      clockPeriodNs = safeClockNs,
+      totalAreaUm2 = totalArea,
+      config = dftConfig,
+      scanInsertion = effectiveScanOutcome,
+    )
+    log += "[DFT] Audit & ATPG: Stuck-At Coverage = ${formatNum(dftReport.stuckAtCoveragePct)}% (${dftReport.detectedFaults}/${dftReport.totalFaults} faults, ${dftReport.atpgVectors.size} vectors)."
 
     return SynthesisReport(
       moduleName = moduleName,
@@ -288,24 +355,31 @@ object RtlSynthesisEngine {
       clocksDetected = sdcSet.clocks,
       inputDelayNs = avgInDelay,
       outputDelayNs = avgOutDelay,
+      maxOutputLoadPf = maxOutLoadPf,
       clockUncertaintyNs = sdcSet.clockUncertaintyNs,
       falsePathCount = fpCount,
       synthesisDurationMs = durationMs,
       preOptCellCount = preOptCellCount.coerceAtLeast(nonPortNodes.size),
       postOptCellCount = nonPortNodes.size,
       engineProfile = engineProfile,
+      dftReport = dftReport,
+      switchingPowerMw = switchingPowerMw,
+      internalPowerMw = internalPowerMw,
+      powerAnalysis = powerReport,
+      rtlDrcReport = rtlDrcReport,
     )
   }
 
   // ==================== ELABORATOR & OPTIMIZER ====================
 
-  private data class IrGraph(val nodes: List<GateNode>, val rawOps: Int)
+  private data class IrGraph(val nodes: List<GateNode>, val rawOps: Int, val flattenedInstances: Int = 0)
 
   private class Elaborator(
     private val design: ParsedVerilogDesign,
     private val module: ParsedVerilogModule,
     private val goal: OptimizationGoal,
     private val warnings: MutableList<String>,
+    private val bitBlast: Boolean = false,
   ) {
     private val nodes = mutableListOf<GateNode>()
     private val idToNodeIndex = HashMap<String, Int>()
@@ -314,6 +388,10 @@ object RtlSynthesisEngine {
     private var instCounter = 0
     private var wireCounter = 0
     private var rawOps = 0
+    private var flattenedInstances = 0
+    private var currentSourceLine = 0
+    private var currentPrefix = ""
+    private var currentHierarchyPath = ""
 
     private fun recordNode(node: GateNode) {
       idToNodeIndex[node.id] = nodes.size
@@ -336,121 +414,22 @@ object RtlSynthesisEngine {
               delayNs = 0.0,
               areaUm2 = 0.0,
               powerUw = 0.0,
+              sourceLine = module.line,
             )
           )
           netToNodeId[port.name] = id
         }
 
-      val seqTargets = mutableSetOf<String>()
-      module.alwaysBlocks.filter { it.isSequential }.forEach { block ->
-        collectAssignedTargets(block.statements, seqTargets)
-      }
-      seqTargets.forEach { regName ->
-        netToNodeId[regName] = "reg_$regName"
-      }
-
-      module.assignments.forEach { assign ->
-        val width = module.signalWidth(assign.target)
-        val srcNet = lowerExpr(assign.expr, width)
-        addBufferOrAlias(assign.target, srcNet, width)
-      }
-
-      module.alwaysBlocks.filter { !it.isSequential }.forEach { block ->
-        val targets = mutableSetOf<String>()
-        collectAssignedTargets(block.statements, targets)
-        targets.forEach { target ->
-          val width = module.signalWidth(target)
-          val expr = extractMuxTreeForTarget(block.statements, target)
-          if (expr != null) {
-            val srcNet = lowerExpr(expr, width)
-            addBufferOrAlias(target, srcNet, width)
-          }
-        }
-      }
-
-      module.alwaysBlocks.filter { it.isSequential }.forEach { block ->
-        val targets = mutableSetOf<String>()
-        collectAssignedTargets(block.statements, targets)
-        targets.forEach { target ->
-          val width = module.signalWidth(target)
-          val (resetCond, resetVal, nextExpr) = extractSeqResetAndNext(block.statements, target)
-          val dNet = lowerExpr(nextExpr, width)
-          val clkNet = block.clockName ?: "clk"
-          val inputs = mutableListOf(dNet, clkNet)
-          val hasReset = resetCond != null
-          if (resetCond != null) {
-            inputs += lowerExpr(resetCond, 1)
-          }
-          if (resetVal != null && resetVal !is VerilogExpr.Const) {
-            inputs += lowerExpr(resetVal, width)
-          }
-          val dffId = if (!idToNodeIndex.containsKey("reg_$target")) "reg_$target" else "reg_${target}_${instCounter++}"
-          recordNode(
-            GateNode(
-              id = dffId,
-              cellName = if (hasReset) "DFFR" else "DFF",
-              gateType = if (hasReset) GateType.DFFR else GateType.DFF,
-              instanceName = "u_reg_$target",
-              inputs = inputs.distinct(),
-              outputNet = target,
-              bitWidth = width,
-              delayNs = 0.0,
-              areaUm2 = 0.0,
-              powerUw = 0.0,
-            )
-          )
-          netToNodeId[target] = dffId
-        }
-      }
-
-      // Elaborate instantiated submodules as hierarchical combinational/sequential cells
-      module.instances.forEach { inst ->
-        val subMod = design.modules.firstOrNull { it.name == inst.moduleType }
-        val inNets = mutableListOf<String>()
-        val outNets = mutableListOf<String>()
-        if (subMod != null && (inst.portConnections.isNotEmpty() || inst.positionalConnections.isNotEmpty())) {
-          subMod.ports.forEachIndexed { idx, p ->
-            val conn = if (inst.portConnections.isNotEmpty()) {
-              inst.portConnections[p.name]
-            } else {
-              inst.positionalConnections.getOrNull(idx)
-            }
-            if (conn != null) {
-              if (p.direction == PortDirection.OUTPUT) {
-                if (conn is VerilogExpr.Signal) outNets += conn.name
-                else if (conn is VerilogExpr.Slice) outNets += conn.name
-              } else {
-                inNets += lowerExpr(conn, p.width)
-              }
-            }
-          }
-        } else {
-          inst.portConnections.values.forEach { expr -> inNets += lowerExpr(expr, 1) }
-          inst.positionalConnections.forEach { expr -> inNets += lowerExpr(expr, 1) }
-        }
-        val cleanInNets = inNets.distinct()
-        if (outNets.isEmpty()) {
-          val targetNet = "${inst.instanceName}_out"
-          emitGate(
-            type = GateType.BUF,
-            inputs = cleanInNets,
-            outputNet = targetNet,
-            width = module.signalWidth(targetNet),
-            customLabel = inst.moduleType.uppercase(Locale.ROOT),
-          )
-        } else {
-          outNets.distinct().forEachIndexed { oIdx, targetNet ->
-            val suffixLabel = if (oIdx == 0) inst.moduleType.uppercase(Locale.ROOT) else "${inst.moduleType.uppercase(Locale.ROOT)}_$oIdx"
-            emitGate(
-              type = GateType.BUF,
-              inputs = cleanInNets,
-              outputNet = targetNet,
-              width = module.signalWidth(targetNet),
-              customLabel = suffixLabel,
-            )
-          }
-        }
-      }
+      val topParams = module.parameters.associate { it.name to it.value }
+      elaborateModuleInternals(
+        mod = module,
+        prefix = "",
+        hierarchyPath = "",
+        localToParentNet = emptyMap(),
+        paramEnv = topParams,
+        depth = 0,
+        activeStack = setOf(module.name),
+      )
 
       module.ports.filter { it.direction == PortDirection.OUTPUT }
         .forEach { port ->
@@ -470,11 +449,343 @@ object RtlSynthesisEngine {
               delayNs = 0.0,
               areaUm2 = 0.0,
               powerUw = 0.0,
+              sourceLine = module.line,
             )
           )
         }
 
-      return IrGraph(nodes = nodes, rawOps = max(rawOps, nodes.size))
+      return IrGraph(
+        nodes = nodes,
+        rawOps = max(rawOps, nodes.size),
+        flattenedInstances = flattenedInstances,
+      )
+    }
+
+    private fun elaborateModuleInternals(
+      mod: ParsedVerilogModule,
+      prefix: String,
+      hierarchyPath: String,
+      localToParentNet: Map<String, String>,
+      paramEnv: Map<String, Int>,
+      depth: Int,
+      activeStack: Set<String>,
+    ) {
+      val prevPrefix = currentPrefix
+      val prevHierarchyPath = currentHierarchyPath
+      currentPrefix = prefix
+      currentHierarchyPath = hierarchyPath
+      try {
+        fun mapSignal(raw: String): String =
+          localToParentNet[raw] ?: if (prefix.isEmpty()) raw else "${prefix}$raw"
+
+      fun resolveWidth(sigName: String): Int {
+        val baseWidth = mod.signalWidth(sigName)
+        if (prefix.isEmpty() || paramEnv.isEmpty()) return baseWidth
+        for (p in mod.parameters) {
+          val ovr = paramEnv[p.name] ?: continue
+          if (ovr != p.value && p.value > 1 && baseWidth == p.value) {
+            return ovr.coerceIn(1, 256)
+          }
+        }
+        return baseWidth
+      }
+
+      val seqTargets = mutableSetOf<String>()
+      mod.alwaysBlocks.filter { it.isSequential }.forEach { block ->
+        collectAssignedTargets(block.statements, seqTargets)
+      }
+      seqTargets.forEach { rawReg ->
+        val mappedReg = mapSignal(rawReg)
+        if (!netToNodeId.containsKey(mappedReg)) {
+          netToNodeId[mappedReg] = "reg_$mappedReg"
+        }
+      }
+
+      mod.assignments.forEach { assign ->
+        currentSourceLine = assign.line
+        val targetNet = mapSignal(assign.target)
+        val width = resolveWidth(assign.target)
+        val remappedExpr = remapExpr(assign.expr, ::mapSignal, paramEnv)
+        val srcNet = lowerExpr(remappedExpr, width)
+        addBufferOrAlias(targetNet, srcNet, width)
+      }
+
+      mod.alwaysBlocks.filter { !it.isSequential }.forEach { block ->
+        currentSourceLine = block.line
+        val targets = mutableSetOf<String>()
+        collectAssignedTargets(block.statements, targets)
+        val remappedStmts = block.statements.map { remapStmt(it, ::mapSignal, paramEnv) }
+        targets.forEach { rawTarget ->
+          val targetNet = mapSignal(rawTarget)
+          val width = resolveWidth(rawTarget)
+          val expr = extractMuxTreeForTarget(remappedStmts, targetNet)
+          if (expr != null) {
+            val srcNet = lowerExpr(expr, width)
+            addBufferOrAlias(targetNet, srcNet, width)
+          }
+        }
+      }
+
+      mod.alwaysBlocks.filter { it.isSequential }.forEach { block ->
+        currentSourceLine = block.line
+        val targets = mutableSetOf<String>()
+        collectAssignedTargets(block.statements, targets)
+        val remappedStmts = block.statements.map { remapStmt(it, ::mapSignal, paramEnv) }
+        val clkNet = block.clockName?.let(::mapSignal) ?: mapSignal("clk")
+        targets.forEach { rawTarget ->
+          val targetNet = mapSignal(rawTarget)
+          val width = resolveWidth(rawTarget)
+          val (resetCond, resetVal, nextExpr) = extractSeqResetAndNext(remappedStmts, targetNet)
+          val dNet = lowerExpr(nextExpr, width)
+          val inputs = mutableListOf(dNet, clkNet)
+          val hasReset = resetCond != null
+          if (resetCond != null) {
+            inputs += lowerExpr(resetCond, 1)
+          }
+          if (resetVal != null && resetVal !is VerilogExpr.Const) {
+            inputs += lowerExpr(resetVal, width)
+          }
+          val baseRegId = "reg_$targetNet"
+          val dffId = if (!idToNodeIndex.containsKey(baseRegId)) baseRegId else "${baseRegId}_${instCounter++}"
+          recordNode(
+            GateNode(
+              id = dffId,
+              cellName = if (hasReset) "DFFR" else "DFF",
+              gateType = if (hasReset) GateType.DFFR else GateType.DFF,
+              instanceName = "u_reg_$targetNet",
+              inputs = inputs.distinct(),
+              outputNet = targetNet,
+              bitWidth = width,
+              delayNs = 0.0,
+              areaUm2 = 0.0,
+              powerUw = 0.0,
+              sourceLine = block.line,
+              hierarchyPath = currentHierarchyPath,
+            )
+          )
+          netToNodeId[targetNet] = dffId
+        }
+      }
+
+      // Recursive per-instance elaboration with #(...) parameter overrides
+      mod.instances.forEachIndexed { idxInMod, inst ->
+        currentSourceLine = inst.line
+        val subMod = design.modules.firstOrNull { it.name == inst.moduleType }
+        if (subMod != null && subMod.name !in activeStack && depth < 6) {
+          flattenedInstances++
+          val childParamEnv = subMod.parameters.associate { it.name to it.value }.toMutableMap()
+          if (inst.symbolicPositionalParamOverrides.isNotEmpty()) {
+            inst.symbolicPositionalParamOverrides.forEachIndexed { pIdx, expr ->
+              val resolved = evalParamExpr(expr, paramEnv) ?: inst.positionalParamOverrides.getOrNull(pIdx)
+              val pDef = subMod.parameters.getOrNull(pIdx)
+              if (pDef != null && resolved != null) {
+                childParamEnv[pDef.name] = resolved
+              }
+            }
+          } else {
+            inst.positionalParamOverrides.forEachIndexed { pIdx, pVal ->
+              subMod.parameters.getOrNull(pIdx)?.let { childParamEnv[it.name] = pVal }
+            }
+          }
+          if (inst.symbolicParamOverrides.isNotEmpty()) {
+            inst.symbolicParamOverrides.forEach { (k, expr) ->
+              childParamEnv[k] = evalParamExpr(expr, paramEnv) ?: inst.paramOverrides[k] ?: childParamEnv[k] ?: 0
+            }
+          } else {
+            inst.paramOverrides.forEach { (k, v) -> childParamEnv[k] = v }
+          }
+
+          val childPortMap = mutableMapOf<String, String>()
+          subMod.ports.forEachIndexed { pIdx, p ->
+            val conn = if (inst.portConnections.isNotEmpty()) {
+              inst.portConnections[p.name]
+            } else {
+              inst.positionalConnections.getOrNull(pIdx)
+            }
+            if (conn != null) {
+              val remappedConn = remapExpr(conn, ::mapSignal, paramEnv)
+              if (p.direction == PortDirection.OUTPUT) {
+                when (remappedConn) {
+                  is VerilogExpr.Signal -> childPortMap[p.name] = remappedConn.name
+                  is VerilogExpr.Slice -> childPortMap[p.name] = remappedConn.name
+                  else -> childPortMap[p.name] = "${prefix}${inst.instanceName}_${p.name}"
+                }
+              } else {
+                val widthHint = childParamEnv[p.name] ?: p.width
+                val loweredInNet = lowerExpr(remappedConn, widthHint)
+                childPortMap[p.name] = loweredInNet
+              }
+            }
+          }
+
+          val childPrefix = "$prefix${inst.instanceName}_${idxInMod}_"
+          val childHierPath = if (hierarchyPath.isEmpty()) inst.instanceName else "$hierarchyPath/${inst.instanceName}"
+          elaborateModuleInternals(
+            mod = subMod,
+            prefix = childPrefix,
+            hierarchyPath = childHierPath,
+            localToParentNet = childPortMap,
+            paramEnv = childParamEnv,
+            depth = depth + 1,
+            activeStack = activeStack + subMod.name,
+          )
+        } else {
+          val inNets = mutableListOf<String>()
+          val outNets = mutableListOf<String>()
+          if (subMod != null && (inst.portConnections.isNotEmpty() || inst.positionalConnections.isNotEmpty())) {
+            subMod.ports.forEachIndexed { pIdx, p ->
+              val conn = if (inst.portConnections.isNotEmpty()) {
+                inst.portConnections[p.name]
+              } else {
+                inst.positionalConnections.getOrNull(pIdx)
+              }
+              if (conn != null) {
+                val remappedConn = remapExpr(conn, ::mapSignal, paramEnv)
+                if (p.direction == PortDirection.OUTPUT) {
+                  if (remappedConn is VerilogExpr.Signal) outNets += remappedConn.name
+                  else if (remappedConn is VerilogExpr.Slice) outNets += remappedConn.name
+                } else {
+                  inNets += lowerExpr(remappedConn, p.width)
+                }
+              }
+            }
+          } else {
+            inst.portConnections.values.forEach { expr -> inNets += lowerExpr(remapExpr(expr, ::mapSignal, paramEnv), 1) }
+            inst.positionalConnections.forEach { expr -> inNets += lowerExpr(remapExpr(expr, ::mapSignal, paramEnv), 1) }
+          }
+          val cleanInNets = inNets.distinct()
+          if (outNets.isEmpty()) {
+            val targetNet = mapSignal("${inst.instanceName}_out")
+            emitGate(
+              type = GateType.BUF,
+              inputs = cleanInNets,
+              outputNet = targetNet,
+              width = resolveWidth("${inst.instanceName}_out"),
+              customLabel = inst.moduleType.uppercase(Locale.ROOT),
+            )
+          } else {
+            outNets.distinct().forEachIndexed { oIdx, targetNet ->
+              val suffixLabel = if (oIdx == 0) inst.moduleType.uppercase(Locale.ROOT) else "${inst.moduleType.uppercase(Locale.ROOT)}_$oIdx"
+              emitGate(
+                type = GateType.BUF,
+                inputs = cleanInNets,
+                outputNet = targetNet,
+                width = resolveWidth(targetNet),
+                customLabel = suffixLabel,
+              )
+            }
+          }
+        }
+      }
+      } finally {
+        currentPrefix = prevPrefix
+        currentHierarchyPath = prevHierarchyPath
+      }
+    }
+
+    private fun evalParamExpr(expr: VerilogExpr, env: Map<String, Int>): Int? = when (expr) {
+      is VerilogExpr.Const -> expr.value.toInt()
+      is VerilogExpr.Signal -> env[expr.name]
+      is VerilogExpr.Unary -> {
+        val v = evalParamExpr(expr.inner, env) ?: return null
+        when (expr.op) {
+          "-" -> -v
+          "+" -> v
+          "~" -> v.inv()
+          "!" -> if (v == 0) 1 else 0
+          else -> null
+        }
+      }
+      is VerilogExpr.Binary -> {
+        val l = evalParamExpr(expr.left, env) ?: return null
+        val r = evalParamExpr(expr.right, env) ?: return null
+        when (expr.op) {
+          "+" -> l + r
+          "-" -> l - r
+          "*" -> l * r
+          "/" -> if (r != 0) l / r else 0
+          "%" -> if (r != 0) l % r else 0
+          "<<" -> l shl (r and 31)
+          ">>" -> l ushr (r and 31)
+          "&" -> l and r
+          "|" -> l or r
+          "^" -> l xor r
+          "==" -> if (l == r) 1 else 0
+          "!=" -> if (l != r) 1 else 0
+          ">" -> if (l > r) 1 else 0
+          ">=" -> if (l >= r) 1 else 0
+          "<" -> if (l < r) 1 else 0
+          "<=" -> if (l <= r) 1 else 0
+          else -> null
+        }
+      }
+      is VerilogExpr.Ternary -> {
+        val c = evalParamExpr(expr.cond, env) ?: return null
+        if (c != 0) evalParamExpr(expr.thenExpr, env) else evalParamExpr(expr.elseExpr, env)
+      }
+      else -> null
+    }
+
+    private fun remapExpr(
+      expr: VerilogExpr,
+      mapSignal: (String) -> String,
+      paramEnv: Map<String, Int>,
+    ): VerilogExpr = when (expr) {
+      is VerilogExpr.Const -> expr
+      is VerilogExpr.Signal -> paramEnv[expr.name]?.let { VerilogExpr.Const(it, 32) } ?: VerilogExpr.Signal(mapSignal(expr.name))
+      is VerilogExpr.Slice -> expr.copy(
+        name = mapSignal(expr.name),
+        msbExpr = expr.msbExpr?.let { remapExpr(it, mapSignal, paramEnv) },
+        lsbExpr = expr.lsbExpr?.let { remapExpr(it, mapSignal, paramEnv) },
+      )
+      is VerilogExpr.Index -> expr.copy(
+        base = remapExpr(expr.base, mapSignal, paramEnv),
+        indexExpr = remapExpr(expr.indexExpr, mapSignal, paramEnv),
+      )
+      is VerilogExpr.Concat -> VerilogExpr.Concat(expr.parts.map { remapExpr(it, mapSignal, paramEnv) })
+      is VerilogExpr.Replication -> VerilogExpr.Replication(expr.count, remapExpr(expr.inner, mapSignal, paramEnv))
+      is VerilogExpr.Unary -> VerilogExpr.Unary(expr.op, remapExpr(expr.inner, mapSignal, paramEnv))
+      is VerilogExpr.Binary -> VerilogExpr.Binary(
+        expr.op,
+        remapExpr(expr.left, mapSignal, paramEnv),
+        remapExpr(expr.right, mapSignal, paramEnv),
+      )
+      is VerilogExpr.Ternary -> VerilogExpr.Ternary(
+        remapExpr(expr.cond, mapSignal, paramEnv),
+        remapExpr(expr.thenExpr, mapSignal, paramEnv),
+        remapExpr(expr.elseExpr, mapSignal, paramEnv),
+      )
+      is VerilogExpr.FuncCall -> VerilogExpr.FuncCall(
+        expr.name,
+        expr.args.map { remapExpr(it, mapSignal, paramEnv) },
+      )
+    }
+
+    private fun remapStmt(
+      stmt: VerilogStmt,
+      mapSignal: (String) -> String,
+      paramEnv: Map<String, Int>,
+    ): VerilogStmt = when (stmt) {
+      is VerilogStmt.Assign -> stmt.copy(
+        target = mapSignal(stmt.target),
+        expr = remapExpr(stmt.expr, mapSignal, paramEnv),
+        targetMsbExpr = stmt.targetMsbExpr?.let { remapExpr(it, mapSignal, paramEnv) },
+        targetLsbExpr = stmt.targetLsbExpr?.let { remapExpr(it, mapSignal, paramEnv) },
+      )
+      is VerilogStmt.IfStmt -> stmt.copy(
+        cond = remapExpr(stmt.cond, mapSignal, paramEnv),
+        thenBranch = stmt.thenBranch.map { remapStmt(it, mapSignal, paramEnv) },
+        elseBranch = stmt.elseBranch.map { remapStmt(it, mapSignal, paramEnv) },
+      )
+      is VerilogStmt.CaseStmt -> stmt.copy(
+        selector = remapExpr(stmt.selector, mapSignal, paramEnv),
+        branches = stmt.branches.map { (pats, body) ->
+          pats.map { remapExpr(it, mapSignal, paramEnv) } to body.map { remapStmt(it, mapSignal, paramEnv) }
+        },
+        defaultBranch = stmt.defaultBranch.map { remapStmt(it, mapSignal, paramEnv) },
+      )
+      is VerilogStmt.Display -> stmt.copy(args = stmt.args.map { remapExpr(it, mapSignal, paramEnv) })
+      is VerilogStmt.AssertStmt -> stmt.copy(cond = remapExpr(stmt.cond, mapSignal, paramEnv))
     }
 
     private fun collectAssignedTargets(stmts: List<VerilogStmt>, out: MutableSet<String>) {
@@ -489,6 +800,7 @@ object RtlSynthesisEngine {
             s.branches.forEach { (_, body) -> collectAssignedTargets(body, out) }
             collectAssignedTargets(s.defaultBranch, out)
           }
+          is VerilogStmt.Display, is VerilogStmt.AssertStmt -> Unit
         }
       }
     }
@@ -524,6 +836,7 @@ object RtlSynthesisEngine {
             }
             current = acc
           }
+          is VerilogStmt.Display, is VerilogStmt.AssertStmt -> Unit
         }
       }
       return current
@@ -645,8 +958,9 @@ object RtlSynthesisEngine {
           val gate = when (expr.op) {
             "~", "!", "-" -> GateType.INV
             "&", "~&" -> GateType.AND2
-            "|", "~|" -> GateType.OR2
-            "^", "~^", "^~" -> GateType.XOR2
+            "|","~|" -> GateType.OR2
+            "^" -> GateType.XOR2
+            "~^", "^~" -> GateType.XNOR2
             else -> GateType.INV
           }
           val key = "${gate.name}_${expr.op}_$inner"
@@ -679,7 +993,7 @@ object RtlSynthesisEngine {
             "^" -> GateType.XOR2
             "~&" -> GateType.NAND2
             "~|" -> GateType.NOR2
-            "^~", "~^" -> GateType.XOR2
+            "^~", "~^" -> GateType.XNOR2
             "+" -> GateType.ADD_CELL
             "-" -> GateType.SUB_CELL
             "*", "/", "%", "**" -> GateType.MUL_CELL
@@ -717,19 +1031,180 @@ object RtlSynthesisEngine {
       width: Int,
       customLabel: String? = null,
     ): String {
+      if (bitBlast && customLabel == null) {
+        when (type) {
+          GateType.ADD_CELL, GateType.SUB_CELL -> {
+            return emitBitBlastedAdder(
+              aNet = inputs.getOrElse(0) { "1'b0" },
+              bNet = inputs.getOrElse(1) { "1'b0" },
+              outputNet = outputNet,
+              width = width,
+              isSub = type == GateType.SUB_CELL,
+            )
+          }
+          GateType.MUL_CELL -> {
+            return emitBitBlastedMultiplier(
+              aNet = inputs.getOrElse(0) { "1'b0" },
+              bNet = inputs.getOrElse(1) { "1'b0" },
+              outputNet = outputNet,
+              width = width,
+            )
+          }
+          GateType.CMP_CELL -> {
+            return emitBitBlastedComparator(
+              aNet = inputs.getOrElse(0) { "1'b0" },
+              bNet = inputs.getOrElse(1) { "1'b0" },
+              outputNet = outputNet,
+              width = width,
+            )
+          }
+          GateType.MUX2 -> {
+            return emitBitBlastedMux(
+              selNet = inputs.getOrElse(0) { "1'b0" },
+              aNet = inputs.getOrElse(1) { "1'b0" },
+              bNet = inputs.getOrElse(2) { "1'b0" },
+              outputNet = outputNet,
+              width = width,
+            )
+          }
+          else -> Unit
+        }
+      }
+      return emitSingleGate(type, inputs, outputNet, width, customLabel)
+    }
+
+    private fun emitBitBlastedAdder(
+      aNet: String,
+      bNet: String,
+      outputNet: String,
+      width: Int,
+      isSub: Boolean,
+    ): String {
+      val bits = width.coerceIn(1, 32)
+      var carryNet = if (isSub) {
+        val cWire = newWire()
+        emitSingleGate(GateType.INV, listOf(bNet), cWire, 1)
+        cWire
+      } else {
+        aNet
+      }
+      val sumTapNets = mutableListOf<String>()
+      var lastId = ""
+      for (bit in 0 until bits) {
+        val bEff = if (isSub) {
+          val invW = newWire()
+          emitSingleGate(GateType.INV, listOf(bNet), invW, 1)
+          invW
+        } else {
+          bNet
+        }
+        val halfXor = newWire()
+        emitSingleGate(GateType.XOR2, listOf(aNet, bEff), halfXor, 1)
+        val genAnd = newWire()
+        emitSingleGate(GateType.AND2, listOf(aNet, bEff), genAnd, 1)
+        val propAnd = newWire()
+        emitSingleGate(GateType.AND2, listOf(halfXor, carryNet), propAnd, 1)
+        val nextCarry = newWire()
+        emitSingleGate(GateType.OR2, listOf(genAnd, propAnd), nextCarry, 1)
+        val sumBitNet = if (bit == bits - 1) outputNet else newWire()
+        lastId = emitSingleGate(GateType.XOR2, listOf(halfXor, carryNet), sumBitNet, if (bit == bits - 1) width else 1)
+        sumTapNets += sumBitNet
+        carryNet = nextCarry
+      }
+      return lastId
+    }
+
+    private fun emitBitBlastedMultiplier(
+      aNet: String,
+      bNet: String,
+      outputNet: String,
+      width: Int,
+    ): String {
+      val stages = width.coerceIn(2, 16)
+      var accumNet = newWire()
+      emitSingleGate(GateType.AND2, listOf(aNet, bNet), accumNet, 1)
+      var lastId = ""
+      for (s in 1 until stages) {
+        val pp = newWire()
+        emitSingleGate(GateType.AND2, listOf(aNet, bNet), pp, 1)
+        val carry = newWire()
+        emitSingleGate(GateType.AND2, listOf(accumNet, pp), carry, 1)
+        val sum = if (s == stages - 1) outputNet else newWire()
+        lastId = emitSingleGate(GateType.XOR2, listOf(accumNet, pp), sum, if (s == stages - 1) width else 1)
+        accumNet = if (s == stages - 1) sum else {
+          val nextStage = newWire()
+          emitSingleGate(GateType.OR2, listOf(sum, carry), nextStage, 1)
+          nextStage
+        }
+      }
+      return lastId
+    }
+
+    private fun emitBitBlastedComparator(
+      aNet: String,
+      bNet: String,
+      outputNet: String,
+      width: Int,
+    ): String {
+      val bits = width.coerceIn(1, 16)
+      var diffTree = newWire()
+      emitSingleGate(GateType.XOR2, listOf(aNet, bNet), diffTree, 1)
+      var lastId = ""
+      for (bit in 1 until bits) {
+        val x = newWire()
+        emitSingleGate(GateType.XOR2, listOf(aNet, bNet), x, 1)
+        val merged = newWire()
+        lastId = emitSingleGate(GateType.OR2, listOf(diffTree, x), merged, 1)
+        diffTree = merged
+      }
+      lastId = emitSingleGate(GateType.INV, listOf(diffTree), outputNet, 1)
+      return lastId
+    }
+
+    private fun emitBitBlastedMux(
+      selNet: String,
+      aNet: String,
+      bNet: String,
+      outputNet: String,
+      width: Int,
+    ): String {
+      val nSel = newWire()
+      emitSingleGate(GateType.INV, listOf(selNet), nSel, 1)
+      val slices = width.coerceIn(1, 8)
+      var lastId = ""
+      for (s in 0 until slices) {
+        val hiAnd = newWire()
+        emitSingleGate(GateType.AND2, listOf(selNet, aNet), hiAnd, 1)
+        val loAnd = newWire()
+        emitSingleGate(GateType.AND2, listOf(nSel, bNet), loAnd, 1)
+        val out = if (s == slices - 1) outputNet else newWire()
+        lastId = emitSingleGate(GateType.OR2, listOf(hiAnd, loAnd), out, if (s == slices - 1) width else 1)
+      }
+      return lastId
+    }
+
+    private fun emitSingleGate(
+      type: GateType,
+      inputs: List<String>,
+      outputNet: String,
+      width: Int,
+      customLabel: String? = null,
+    ): String {
       val id = "g_${++instCounter}"
       recordNode(
         GateNode(
           id = id,
           cellName = customLabel ?: type.shortLabel,
           gateType = type,
-          instanceName = "u_${type.shortLabel.lowercase(Locale.ROOT)}_$instCounter",
+          instanceName = "${currentPrefix}u_${type.shortLabel.lowercase(Locale.ROOT)}_$instCounter",
           inputs = inputs,
           outputNet = outputNet,
           bitWidth = width,
           delayNs = 0.0,
           areaUm2 = 0.0,
           powerUw = 0.0,
+          sourceLine = currentSourceLine,
+          hierarchyPath = currentHierarchyPath,
         )
       )
       netToNodeId[outputNet] = id
@@ -795,6 +1270,7 @@ object RtlSynthesisEngine {
         GateType.NAND2 -> Quint("NAND2x1_ASAP7", GateType.NAND2, 0.022, 0.11 * wFactor, 2.7 * wFactor)
         GateType.NOR2 -> Quint("NOR2x1_ASAP7", GateType.NOR2, 0.025, 0.11 * wFactor, 2.9 * wFactor)
         GateType.XOR2 -> Quint("XOR2x1_ASAP7", GateType.XOR2, 0.048, 0.22 * wFactor, 5.4 * wFactor)
+        GateType.XNOR2 -> Quint("XNOR2x1_ASAP7", GateType.XNOR2, 0.049, 0.22 * wFactor, 5.5 * wFactor)
         GateType.MUX2 -> Quint("MUX2x1_ASAP7", GateType.MUX2, 0.052, 0.26 * wFactor, 6.2 * wFactor)
         GateType.ADD_CELL -> Quint("FA_ADD_ASAP7", GateType.ADD_CELL, 0.095 + node.bitWidth * 0.022, 0.68 * wFactor, 14.5 * wFactor)
         GateType.SUB_CELL -> Quint("FA_SUB_ASAP7", GateType.SUB_CELL, 0.105 + node.bitWidth * 0.024, 0.74 * wFactor, 15.8 * wFactor)
@@ -802,6 +1278,9 @@ object RtlSynthesisEngine {
         GateType.CMP_CELL -> Quint("COMPx1_ASAP7", GateType.CMP_CELL, 0.072 + node.bitWidth * 0.014, 0.45 * wFactor, 9.2 * wFactor)
         GateType.DFF -> Quint("DFFx1_ASAP7", GateType.DFF, 0.045, 0.42 * wFactor, 11.0 * wFactor)
         GateType.DFFR -> Quint("DFFRx1_ASAP7", GateType.DFFR, 0.052, 0.48 * wFactor, 12.6 * wFactor)
+        GateType.SDFF -> Quint("SDFFx1_ASAP7", GateType.SDFF, 0.075, 0.48 * wFactor, 12.2 * wFactor)
+        GateType.SDFFR -> Quint("SDFFRx1_ASAP7", GateType.SDFFR, 0.082, 0.55 * wFactor, 13.8 * wFactor)
+        GateType.LOCKUP_LATCH -> Quint("DLLATCHx1_ASAP7", GateType.LOCKUP_LATCH, 0.04, 0.24, 2.5)
         else -> Quint("CELL_ASAP7", node.gateType, 0.035, 0.15 * wFactor, 3.5 * wFactor)
       }
       return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
@@ -817,6 +1296,7 @@ object RtlSynthesisEngine {
         GateType.NAND2 -> Quint("sky130_nand2_1", GateType.NAND2, 0.11, 5.0 * wFactor, 9.1 * wFactor)
         GateType.NOR2 -> Quint("sky130_nor2_1", GateType.NOR2, 0.13, 5.0 * wFactor, 9.5 * wFactor)
         GateType.XOR2 -> Quint("sky130_xor2_1", GateType.XOR2, 0.27, 10.0 * wFactor, 17.6 * wFactor)
+        GateType.XNOR2 -> Quint("sky130_xnor2_1", GateType.XNOR2, 0.28, 10.0 * wFactor, 17.9 * wFactor)
         GateType.MUX2 -> Quint("sky130_mux2_1", GateType.MUX2, 0.29, 11.25 * wFactor, 19.2 * wFactor)
         GateType.ADD_CELL -> Quint("sky130_fa_add", GateType.ADD_CELL, 0.42 + node.bitWidth * 0.09, 26.0 * wFactor, 44.0 * wFactor)
         GateType.SUB_CELL -> Quint("sky130_fa_sub", GateType.SUB_CELL, 0.46 + node.bitWidth * 0.095, 28.5 * wFactor, 47.0 * wFactor)
@@ -824,6 +1304,9 @@ object RtlSynthesisEngine {
         GateType.CMP_CELL -> Quint("sky130_cmp_1", GateType.CMP_CELL, 0.34 + node.bitWidth * 0.05, 18.0 * wFactor, 29.0 * wFactor)
         GateType.DFF -> Quint("sky130_dfxtp_1", GateType.DFF, 0.26, 20.0 * wFactor, 32.0 * wFactor)
         GateType.DFFR -> Quint("sky130_dfrtp_1", GateType.DFFR, 0.31, 22.5 * wFactor, 36.5 * wFactor)
+        GateType.SDFF -> Quint("sky130_sdfxtp_1", GateType.SDFF, 0.30, 22.8 * wFactor, 35.4 * wFactor)
+        GateType.SDFFR -> Quint("sky130_sdfrtp_1", GateType.SDFFR, 0.35, 25.6 * wFactor, 40.0 * wFactor)
+        GateType.LOCKUP_LATCH -> Quint("sky130_dlxtn_1", GateType.LOCKUP_LATCH, 0.16, 11.2, 12.0)
         else -> Quint("sky130_cell", node.gateType, 0.2, 7.5 * wFactor, 12.0 * wFactor)
       }
       return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
@@ -839,6 +1322,7 @@ object RtlSynthesisEngine {
         GateType.NAND2 -> Quint("gf180_nand2_1", GateType.NAND2, 0.16, 7.5 * wFactor, 12.6 * wFactor)
         GateType.NOR2 -> Quint("gf180_nor2_1", GateType.NOR2, 0.19, 7.5 * wFactor, 13.1 * wFactor)
         GateType.XOR2 -> Quint("gf180_xor2_1", GateType.XOR2, 0.38, 15.2 * wFactor, 24.0 * wFactor)
+        GateType.XNOR2 -> Quint("gf180_xnor2_1", GateType.XNOR2, 0.39, 15.2 * wFactor, 24.4 * wFactor)
         GateType.MUX2 -> Quint("gf180_mux2_1", GateType.MUX2, 0.41, 16.8 * wFactor, 26.5 * wFactor)
         GateType.ADD_CELL -> Quint("gf180_fa_add", GateType.ADD_CELL, 0.62 + node.bitWidth * 0.12, 39.0 * wFactor, 58.0 * wFactor)
         GateType.SUB_CELL -> Quint("gf180_fa_sub", GateType.SUB_CELL, 0.66 + node.bitWidth * 0.13, 42.0 * wFactor, 61.5 * wFactor)
@@ -846,6 +1330,9 @@ object RtlSynthesisEngine {
         GateType.CMP_CELL -> Quint("gf180_cmp_1", GateType.CMP_CELL, 0.48 + node.bitWidth * 0.07, 26.0 * wFactor, 39.0 * wFactor)
         GateType.DFF -> Quint("gf180_dffq_1", GateType.DFF, 0.37, 29.0 * wFactor, 43.0 * wFactor)
         GateType.DFFR -> Quint("gf180_dffrq_1", GateType.DFFR, 0.43, 33.0 * wFactor, 48.0 * wFactor)
+        GateType.SDFF -> Quint("gf180_sdffq_1", GateType.SDFF, 0.41, 33.1 * wFactor, 47.5 * wFactor)
+        GateType.SDFFR -> Quint("gf180_sdffrq_1", GateType.SDFFR, 0.47, 37.6 * wFactor, 52.8 * wFactor)
+        GateType.LOCKUP_LATCH -> Quint("gf180_dlatn_1", GateType.LOCKUP_LATCH, 0.22, 16.4, 16.0)
         else -> Quint("gf180_cell", node.gateType, 0.28, 11.0 * wFactor, 16.0 * wFactor)
       }
       return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
@@ -861,6 +1348,7 @@ object RtlSynthesisEngine {
         GateType.NAND2 -> Quint("NAND2_X1", GateType.NAND2, 0.052, 0.79 * wFactor, 4.4 * wFactor)
         GateType.NOR2 -> Quint("NOR2_X1", GateType.NOR2, 0.061, 0.79 * wFactor, 4.7 * wFactor)
         GateType.XOR2 -> Quint("XOR2_X1", GateType.XOR2, 0.115, 1.59 * wFactor, 8.9 * wFactor)
+        GateType.XNOR2 -> Quint("XNOR2_X1", GateType.XNOR2, 0.118, 1.59 * wFactor, 9.1 * wFactor)
         GateType.MUX2 -> Quint("MUX2_X1", GateType.MUX2, 0.128, 1.86 * wFactor, 9.8 * wFactor)
         GateType.ADD_CELL -> Quint("FA_X1_ADD", GateType.ADD_CELL, 0.21 + node.bitWidth * 0.045, 4.52 * wFactor, 22.0 * wFactor)
         GateType.SUB_CELL -> Quint("FA_X1_SUB", GateType.SUB_CELL, 0.23 + node.bitWidth * 0.048, 4.92 * wFactor, 24.0 * wFactor)
@@ -868,6 +1356,9 @@ object RtlSynthesisEngine {
         GateType.CMP_CELL -> Quint("CMP_X1", GateType.CMP_CELL, 0.16 + node.bitWidth * 0.028, 3.1 * wFactor, 14.5 * wFactor)
         GateType.DFF -> Quint("DFF_X1", GateType.DFF, 0.11, 4.52 * wFactor, 16.8 * wFactor)
         GateType.DFFR -> Quint("DFFR_X1", GateType.DFFR, 0.13, 5.05 * wFactor, 19.2 * wFactor)
+        GateType.SDFF -> Quint("SDFF_X1", GateType.SDFF, 0.145, 5.15 * wFactor, 18.6 * wFactor)
+        GateType.SDFFR -> Quint("SDFFR_X1", GateType.SDFFR, 0.165, 5.76 * wFactor, 21.1 * wFactor)
+        GateType.LOCKUP_LATCH -> Quint("DLL_X1", GateType.LOCKUP_LATCH, 0.08, 2.38, 6.0)
         else -> Quint("CELL_N45", node.gateType, 0.09, 1.3 * wFactor, 6.5 * wFactor)
       }
       return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
@@ -878,7 +1369,7 @@ object RtlSynthesisEngine {
         GateType.CONST -> Quint("GND_VCC", GateType.CONST, 0.05, 0.5, 0.5)
         GateType.INV, GateType.BUF, GateType.AND2, GateType.OR2, GateType.NAND2, GateType.NOR2 ->
           Quint("LUT4", GateType.LUT4, 0.22, 1.0 * max(1, node.bitWidth / 2), 14.0 * wFactor)
-        GateType.XOR2, GateType.MUX2, GateType.CMP_CELL ->
+        GateType.XOR2, GateType.XNOR2, GateType.MUX2, GateType.CMP_CELL ->
           Quint("LUT6", GateType.LUT6, 0.28, 1.5 * max(1, node.bitWidth / 2), 19.0 * wFactor)
         GateType.ADD_CELL, GateType.SUB_CELL ->
           Quint("CARRY4", GateType.CARRY4, 0.36 + (node.bitWidth / 4.0) * 0.14, 2.5 * wFactor, 31.0 * wFactor)
@@ -886,6 +1377,9 @@ object RtlSynthesisEngine {
           Quint("DSP48E1", GateType.MUL_CELL, 0.95, 12.0, 68.0)
         GateType.DFF -> Quint("FDRE", GateType.DFF, 0.21, 1.0 * node.bitWidth, 16.0 * wFactor)
         GateType.DFFR -> Quint("FDCE", GateType.DFFR, 0.24, 1.0 * node.bitWidth, 17.5 * wFactor)
+        GateType.SDFF -> Quint("FDRE_SCAN", GateType.SDFF, 0.25, 1.2 * node.bitWidth, 18.0 * wFactor)
+        GateType.SDFFR -> Quint("FDCE_SCAN", GateType.SDFFR, 0.28, 1.2 * node.bitWidth, 19.5 * wFactor)
+        GateType.LOCKUP_LATCH -> Quint("LDCE", GateType.LOCKUP_LATCH, 0.14, 1.0, 6.5)
         else -> Quint("LUT6", GateType.LUT6, 0.25, 1.2 * wFactor, 15.0 * wFactor)
       }
       return node.copy(cellName = cell, gateType = gate, delayNs = d, areaUm2 = a, powerUw = p)
@@ -940,11 +1434,21 @@ object RtlSynthesisEngine {
     edges: List<NetEdge>,
     clockPeriodNs: Double,
     sdcSet: SdcConstraintSet = SdcParser.parse("", clockPeriodNs),
+    library: TargetLibrary = TargetLibrary.ASAP7_7NM,
   ): StaResult {
     val nodeMap = nodes.associateBy { it.id }.toMutableMap()
     val outgoing = edges.groupBy { it.fromNodeId }
     val incoming = edges.groupBy { it.toNodeId }
     val uncertaintyNs = sdcSet.clockUncertaintyNs
+    val outputLoadDelayByNodeId = nodes.associate { node ->
+      val delay = if (node.gateType == GateType.OUTPUT_PORT) {
+        val loadPf = sdcSet.outputLoadForPort(node.outputNet)
+        SdcParser.outputLoadDelayNs(loadPf, library)
+      } else {
+        0.0
+      }
+      node.id to delay
+    }
 
     // Resolve clock domain & period per node (multi-clock support)
     val clockPeriodByName = sdcSet.clocks.associate { it.name.lowercase(Locale.ROOT) to it.periodNs } +
@@ -1018,8 +1522,13 @@ object RtlSynthesisEngine {
           val bestDriver = drivers.maxByOrNull { it.second }
           val maxInArr = bestDriver?.second ?: 0.0
           val maxInLvl = drivers.maxOfOrNull { it.third } ?: -1
+          val effDelay = if (node.gateType == GateType.OUTPUT_PORT) {
+            outputLoadDelayByNodeId[id] ?: 0.0
+          } else {
+            node.delayNs
+          }
           levelMap[id] = maxInLvl + 1
-          arrivalMap[id] = maxInArr + node.delayNs
+          arrivalMap[id] = maxInArr + effDelay
           if (bestDriver != null) {
             predMap[id] = bestDriver.first
             launchSourceMap[id] = launchSourceMap[bestDriver.first].orEmpty()
@@ -1089,13 +1598,19 @@ object RtlSynthesisEngine {
         } else {
           arrivalMap[cursor] ?: 0.0
         }
+        val stepDelay = if (node.gateType == GateType.OUTPUT_PORT) {
+          outputLoadDelayByNodeId[node.id] ?: 0.0
+        } else {
+          node.delayNs
+        }
         criticalStepsReversed += TimingPathStep(
           nodeId = node.id,
           instanceName = node.instanceName,
           cellName = node.cellName,
           netName = node.outputNet,
-          incrDelayNs = node.delayNs,
+          incrDelayNs = stepDelay,
           arrivalNs = arr,
+          sourceLine = node.sourceLine,
         )
       }
       cursor = predMap[cursor]
@@ -1111,11 +1626,18 @@ object RtlSynthesisEngine {
       } else {
         val minOutReq = (outgoing[id] ?: emptyList()).minOfOrNull { edge ->
           val dstNode = nodeMap[edge.toNodeId]
-          if (dstNode?.gateType?.isSequential == true) {
-            val seqReq = endpointReqMap[dstNode.id] ?: (clockPeriodNs - uncertaintyNs)
-            seqReq - dstNode.delayNs
-          } else {
-            (requiredMap[edge.toNodeId] ?: (clockPeriodNs - uncertaintyNs)) - (dstNode?.delayNs ?: 0.0)
+          when {
+            dstNode?.gateType?.isSequential == true -> {
+              val seqReq = endpointReqMap[dstNode.id] ?: (clockPeriodNs - uncertaintyNs)
+              seqReq - dstNode.delayNs
+            }
+            dstNode?.gateType == GateType.OUTPUT_PORT -> {
+              val outReq = requiredMap[edge.toNodeId] ?: (clockPeriodNs - uncertaintyNs)
+              outReq - (outputLoadDelayByNodeId[dstNode.id] ?: 0.0)
+            }
+            else -> {
+              (requiredMap[edge.toNodeId] ?: (clockPeriodNs - uncertaintyNs)) - (dstNode?.delayNs ?: 0.0)
+            }
           }
         } ?: (clockPeriodNs - uncertaintyNs)
         requiredMap[id] = minOutReq
@@ -1136,7 +1658,13 @@ object RtlSynthesisEngine {
       val req = requiredMap[node.id] ?: clockPeriodNs
       val (clkDom, _) = clockForNode(node)
       val isFp = node.id in falsePathNodeIds
+      val effDelay = if (node.gateType == GateType.OUTPUT_PORT) {
+        outputLoadDelayByNodeId[node.id] ?: 0.0
+      } else {
+        node.delayNs
+      }
       node.copy(
+        delayNs = effDelay,
         level = lvl,
         arrivalNs = arr,
         requiredNs = req,
@@ -1201,6 +1729,26 @@ object RtlSynthesisEngine {
 
     nodes.filter { !it.gateType.isPort }.forEach { cell ->
       val pinBindings = when {
+        cell.gateType == GateType.LOCKUP_LATCH -> {
+          val d = cell.inputs.getOrElse(0) { "1'b0" }
+          val gn = cell.inputs.getOrElse(1) { "clk" }
+          ".D($d), .GN($gn), .Q(${cell.outputNet})"
+        }
+        cell.gateType == GateType.SDFF || cell.gateType == GateType.SDFFR -> {
+          val d = cell.inputs.getOrElse(0) { "1'b0" }
+          val clk = cell.inputs.getOrElse(1) { "clk" }
+          val hasRst = cell.gateType == GateType.SDFFR
+          val rst = if (hasRst) cell.inputs.getOrNull(2) else null
+          val seIdx = if (hasRst) 3 else 2
+          val siIdx = if (hasRst) 4 else 3
+          val se = cell.inputs.getOrElse(seIdx) { "scan_en" }
+          val si = cell.inputs.getOrElse(siIdx) { "scan_in_0" }
+          if (rst != null) {
+            ".CLK($clk), .RST($rst), .D($d), .SE($se), .SI($si), .Q(${cell.outputNet})"
+          } else {
+            ".CLK($clk), .D($d), .SE($se), .SI($si), .Q(${cell.outputNet})"
+          }
+        }
         cell.gateType.isSequential -> {
           val d = cell.inputs.getOrElse(0) { "1'b0" }
           val clk = cell.inputs.getOrElse(1) { "clk" }
@@ -1226,6 +1774,13 @@ object RtlSynthesisEngine {
         }
       }
       sb.appendLine("  ${cell.cellName} ${cell.instanceName} ( $pinBindings );")
+    }
+
+    val tailAssigns = ScanChainStitcher.emitOutputTailAssignments(ports, nodes)
+    if (tailAssigns.isNotEmpty()) {
+      sb.appendLine()
+      sb.appendLine("  // DFT Scan-Out Chain Tail Stitching")
+      tailAssigns.forEach { sb.appendLine(it) }
     }
 
     sb.appendLine("endmodule")

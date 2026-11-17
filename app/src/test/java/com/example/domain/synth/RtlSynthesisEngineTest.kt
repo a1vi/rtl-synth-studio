@@ -10,7 +10,7 @@ class RtlSynthesisEngineTest {
 
   @Test
   fun synthesizeCounter_producesSequentialAndCombinationalCells() {
-    val preset = PresetRtlDesigns.templates.first { it.name == "counter_8bit" }
+    val preset = TestRtlFixtures.counter8Bit
     val result = RtlSynthesisEngine.synthesize(
       verilogSource = preset.verilogCode,
       library = TargetLibrary.ASAP7_7NM,
@@ -28,7 +28,7 @@ class RtlSynthesisEngineTest {
 
   @Test
   fun synthesizeAlu_sky130_vs_asap7_scalesDelayAndArea() {
-    val preset = PresetRtlDesigns.templates.first { it.name == "alu_8bit_sv" }
+    val preset = TestRtlFixtures.alu8BitSv
     val asap7 = (RtlSynthesisEngine.synthesize(
       preset.verilogCode, TargetLibrary.ASAP7_7NM, OptimizationGoal.MIN_DELAY, 2.0
     ) as SynthesisResult.Success).report
@@ -114,5 +114,24 @@ class RtlSynthesisEngineTest {
     assertTrue(updated.edges.any { it.fromNodeId == "man_dff" && it.toNodeId == "out_out_y" })
     assertTrue(updated.netlistVerilog.contains("AND2x1_ASAP7 u_and_1"))
     assertTrue(updated.netlistVerilog.contains("DFFx1_ASAP7 u_dff_1"))
+  }
+
+  @Test
+  fun allHardPresets_synthesizeWithNonTrivialDatapathAndSequentialCells() {
+    assertTrue("Expected at least 5 hard RTL presets", PresetRtlDesigns.templates.size >= 5)
+    PresetRtlDesigns.templates.forEach { tpl ->
+      val res = RtlSynthesisEngine.synthesize(
+        verilogSource = tpl.verilogCode,
+        library = tpl.defaultLibrary,
+        goal = tpl.defaultGoal,
+        clockPeriodNs = tpl.defaultClockNs,
+        dftConfig = DftConfig(scanInsertionEnabled = true),
+      )
+      assertTrue("Expected synthesis success for hard preset ${tpl.name}, got $res", res is SynthesisResult.Success)
+      val report = (res as SynthesisResult.Success).report
+      assertTrue("Hard preset ${tpl.name} should have sequential cells", report.seqCellCount >= 2)
+      assertTrue("Hard preset ${tpl.name} should have combinational cells", report.combCellCount >= 4)
+      assertTrue("Hard preset ${tpl.name} should produce DFT report", report.dftReport != null)
+    }
   }
 }

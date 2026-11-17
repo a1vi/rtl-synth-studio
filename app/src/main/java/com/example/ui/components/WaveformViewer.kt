@@ -3,6 +3,8 @@ package com.example.ui.components
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -42,9 +44,17 @@ import com.example.domain.synth.SimulationResult
 import com.example.domain.synth.WaveformRadix
 import com.example.ui.theme.JetBrainsMonoFamily
 
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import java.util.Locale
+
 private val LABEL_COL_WIDTH = 108.dp
 private val CYCLE_COL_WIDTH = 44.dp
 private val ROW_HEIGHT = 42.dp
+private val SUB_BIT_ROW_HEIGHT = 30.dp
 
 @Composable
 fun WaveformViewer(
@@ -55,9 +65,14 @@ fun WaveformViewer(
   modifier: Modifier = Modifier,
   zoomScale: Float = 1f,
   visibleSignals: Set<String> = emptySet(),
+  cursorBCycle: Int? = null,
+  onZoomDelta: ((Float) -> Unit)? = null,
+  signalSearchQuery: String = "",
+  signalGroupFilter: Int = 0, // 0=All, 1=Inputs, 2=Outputs, 3=Registers, 4=Clock
 ) {
   val scrollState = rememberScrollState()
   val textMeasurer = rememberTextMeasurer()
+  var expandedBusNames by remember(simulation.moduleName) { mutableStateOf(emptySet<String>()) }
 
   val primary = MaterialTheme.colorScheme.primary
   val secondary = MaterialTheme.colorScheme.secondary
@@ -68,10 +83,18 @@ fun WaveformViewer(
 
   val cycleColWidth = (CYCLE_COL_WIDTH.value * zoomScale.coerceIn(0.6f, 2.5f)).dp
   val totalWaveformWidth = cycleColWidth * simulation.cycleCount
-  val filteredTraces = if (visibleSignals.isEmpty()) {
-    simulation.traces
-  } else {
-    simulation.traces.filter { it.name in visibleSignals }
+  val q = signalSearchQuery.trim().lowercase(Locale.ROOT)
+  val filteredTraces = simulation.traces.filter { trace ->
+    val visOk = visibleSignals.isEmpty() || trace.name in visibleSignals
+    val queryOk = q.isEmpty() || trace.name.lowercase(Locale.ROOT).contains(q)
+    val groupOk = when (signalGroupFilter) {
+      1 -> trace.direction == PortDirection.INPUT
+      2 -> trace.direction == PortDirection.OUTPUT
+      3 -> trace.isSequentialReg
+      4 -> trace.isClock
+      else -> true
+    }
+    visOk && queryOk && groupOk
   }
 
   Surface(
@@ -81,6 +104,26 @@ fun WaveformViewer(
     modifier = modifier
       .fillMaxWidth()
       .border(1.dp, outline.copy(alpha = 0.28f), MaterialTheme.shapes.large)
+      .then(
+        if (onZoomDelta != null) {
+          Modifier.pointerInput(onZoomDelta) {
+            awaitEachGesture {
+              do {
+                val event = awaitPointerEvent()
+                if (event.changes.count { it.pressed } >= 2) {
+                  val zoom = event.calculateZoom()
+                  if (zoom != 1f) {
+                    onZoomDelta(zoom)
+                    event.changes.forEach { it.consume() }
+                  }
+                }
+              } while (event.changes.any { it.pressed })
+            }
+          }
+        } else {
+          Modifier
+        }
+      )
       .testTag("waveform_viewer_card"),
   ) {
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -111,23 +154,39 @@ fun WaveformViewer(
         ) {
           for (c in 0 until simulation.cycleCount) {
             val isSel = c == selectedCycle
+            val isCurB = c == cursorBCycle
+            val cellBg = when {
+              isSel -> primary.copy(alpha = 0.22f)
+              isCurB -> secondary.copy(alpha = 0.22f)
+              else -> Color.Transparent
+            }
             Box(
               modifier = Modifier
                 .width(cycleColWidth)
-                .background(if (isSel) primary.copy(alpha = 0.22f) else Color.Transparent)
+                .background(cellBg)
                 .pointerInput(c) {
                   detectTapGestures { onSelectCycle(c) }
                 }
                 .padding(vertical = 8.dp),
               contentAlignment = Alignment.Center,
             ) {
+              val labelPrefix = when {
+                isSel && isCurB -> "AB:"
+                isSel && cursorBCycle != null -> "A:"
+                isCurB -> "B:"
+                else -> ""
+              }
               Text(
-                text = "C$c",
+                text = "${labelPrefix}C$c",
                 style = TextStyle(
                   fontFamily = JetBrainsMonoFamily,
                   fontSize = 10.sp,
-                  fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal,
-                  color = if (isSel) primary else onSurfaceVariant,
+                  fontWeight = if (isSel || isCurB) FontWeight.Bold else FontWeight.Normal,
+                  color = when {
+                    isSel -> primary
+                    isCurB -> secondary
+                    else -> onSurfaceVariant
+                  },
                 ),
               )
             }
@@ -146,6 +205,8 @@ fun WaveformViewer(
           else -> onSurface
         }
 
+        val isExpandableBus = trace.width > 1 && !trace.isClock
+        val isExpanded = trace.name in expandedBusNames
         Row(
           modifier = Modifier
             .fillMaxWidth()
@@ -156,15 +217,24 @@ fun WaveformViewer(
             ),
           verticalAlignment = Alignment.CenterVertically,
         ) {
-          // Left Signal Name Rail
+          // Left Signal Name Rail (tap multi-bit buses to expand/collapse bit slices)
           Column(
             modifier = Modifier
               .width(LABEL_COL_WIDTH)
+              .then(
+                if (isExpandableBus) {
+                  Modifier.clickable {
+                    expandedBusNames = if (isExpanded) expandedBusNames - trace.name else expandedBusNames + trace.name
+                  }
+                } else {
+                  Modifier
+                }
+              )
               .padding(horizontal = 10.dp),
             verticalArrangement = Arrangement.Center,
           ) {
             Text(
-              text = trace.name,
+              text = if (isExpandableBus) "${if (isExpanded) "▼ " else "▶ "}${trace.name}" else trace.name,
               style = TextStyle(
                 fontFamily = JetBrainsMonoFamily,
                 fontSize = 11.sp,
@@ -216,21 +286,34 @@ fun WaveformViewer(
               val topY = 9.dp.toPx()
               val botY = size.height - 9.dp.toPx()
 
-              // Selected cycle vertical cursor band
+              // Selected cycle A vertical cursor band
               drawRect(
                 color = primary.copy(alpha = 0.14f),
                 topLeft = Offset(selectedCycle * cycleW, 0f),
                 size = Size(cycleW, size.height),
               )
 
+              // Optional Cursor B measurement band
+              if (cursorBCycle != null && cursorBCycle in 0 until simulation.cycleCount) {
+                drawRect(
+                  color = secondary.copy(alpha = 0.14f),
+                  topLeft = Offset(cursorBCycle * cycleW, 0f),
+                  size = Size(cycleW, size.height),
+                )
+              }
+
               // Vertical cycle gridlines
               for (c in 0..simulation.cycleCount) {
                 val gx = c * cycleW
                 drawLine(
-                  color = outline.copy(alpha = if (c == selectedCycle) 0.45f else 0.14f),
+                  color = when (c) {
+                    selectedCycle -> primary.copy(alpha = 0.65f)
+                    cursorBCycle -> secondary.copy(alpha = 0.65f)
+                    else -> outline.copy(alpha = 0.14f)
+                  },
                   start = Offset(gx, 0f),
                   end = Offset(gx, size.height),
-                  strokeWidth = 1f,
+                  strokeWidth = if (c == selectedCycle || c == cursorBCycle) 1.8f else 1f,
                 )
               }
 
@@ -261,6 +344,55 @@ fun WaveformViewer(
                   textColor = onSurface,
                   textMeasurer = textMeasurer,
                 )
+              }
+            }
+          }
+        }
+        if (isExpandableBus && isExpanded) {
+          val bitLimit = trace.width.coerceAtMost(8)
+          for (bitIdx in (bitLimit - 1) downTo 0) {
+            val bitTrace = SignalTrace(
+              name = "${trace.name}[$bitIdx]",
+              direction = trace.direction,
+              width = 1,
+              isClock = false,
+              isReset = false,
+              isSequentialReg = trace.isSequentialReg,
+              values = trace.values.map { (it ushr bitIdx) and 1L },
+            )
+            HorizontalDivider(color = outline.copy(alpha = 0.08f))
+            Row(
+              modifier = Modifier
+                .fillMaxWidth()
+                .height(SUB_BIT_ROW_HEIGHT)
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.18f)),
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Box(
+                modifier = Modifier.width(LABEL_COL_WIDTH).padding(start = 18.dp, end = 8.dp),
+              ) {
+                Text(
+                  text = bitTrace.name,
+                  style = TextStyle(fontFamily = JetBrainsMonoFamily, fontSize = 10.sp, color = onSurfaceVariant),
+                  maxLines = 1,
+                )
+              }
+              Box(modifier = Modifier.weight(1f).horizontalScroll(scrollState)) {
+                Canvas(
+                  modifier = Modifier
+                    .width(totalWaveformWidth)
+                    .height(SUB_BIT_ROW_HEIGHT)
+                    .testTag("waveform_bit_${trace.name}_$bitIdx"),
+                ) {
+                  val cycleW = size.width / simulation.cycleCount.coerceAtLeast(1)
+                  drawSingleBitTrace(
+                    trace = bitTrace,
+                    cycleW = cycleW,
+                    topY = 6.dp.toPx(),
+                    botY = size.height - 6.dp.toPx(),
+                    color = traceColor.copy(alpha = 0.85f),
+                  )
+                }
               }
             }
           }

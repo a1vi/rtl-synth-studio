@@ -113,6 +113,7 @@ fun StaTimingTableView(
   report: SynthesisReport,
   onInspectNode: (String) -> Unit,
   modifier: Modifier = Modifier,
+  onJumpToRtlLine: ((Int) -> Unit)? = null,
 ) {
   var sortColumn by remember { mutableStateOf(StaSortColumn.SLACK) }
   var sortDirection by remember { mutableStateOf(StaSortDirection.ASCENDING) }
@@ -289,6 +290,10 @@ fun StaTimingTableView(
               testTag = "sta_sort_required",
             )
             StaticHeaderCell(
+              title = "Start → End",
+              width = 134.dp,
+            )
+            StaticHeaderCell(
               title = "Net / Stage",
               width = 98.dp,
             )
@@ -324,6 +329,11 @@ fun StaTimingTableView(
                   node = node,
                   striped = index % 2 == 1,
                   onClick = { onInspectNode(node.id) },
+                  onJumpToLine = if (node.sourceLine > 0 && onJumpToRtlLine != null) {
+                    { onJumpToRtlLine(node.sourceLine) }
+                  } else {
+                    null
+                  },
                 )
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.14f))
               }
@@ -411,6 +421,7 @@ private fun StaTimingRow(
   node: GateNode,
   striped: Boolean,
   onClick: () -> Unit,
+  onJumpToLine: (() -> Unit)? = null,
 ) {
   val rowBg = when {
     node.slackNs < 0.0 -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.24f)
@@ -544,6 +555,18 @@ private fun StaTimingRow(
         .padding(horizontal = 4.dp),
     )
 
+    // Startpoint -> Endpoint column
+    val startPin = node.inputs.firstOrNull()?.takeIf { it.isNotBlank() } ?: "PI"
+    Text(
+      text = "$startPin → ${node.outputNet}",
+      style = monoStyle.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+      maxLines = 1,
+      overflow = TextOverflow.Ellipsis,
+      modifier = Modifier
+        .width(134.dp)
+        .padding(horizontal = 6.dp),
+    )
+
     // Net / Stage column
     Column(
       modifier = Modifier
@@ -558,11 +581,27 @@ private fun StaTimingRow(
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
       )
-      Text(
-        text = "L${node.level} · ${node.clockDomain}",
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-      )
+      if (onJumpToLine != null && node.sourceLine > 0) {
+        Surface(
+          onClick = onJumpToLine,
+          color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+          shape = MaterialTheme.shapes.extraSmall,
+          modifier = Modifier.testTag("sta_jump_line_${node.id}"),
+        ) {
+          Text(
+            text = "L${node.level} · Line ${node.sourceLine} ↗",
+            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+          )
+        }
+      } else {
+        Text(
+          text = "L${node.level} · ${node.clockDomain}",
+          style = MaterialTheme.typography.labelSmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+      }
     }
   }
 }

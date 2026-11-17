@@ -175,7 +175,12 @@ class ReportsScreenTest {
     composeTestRule.onNodeWithTag("sta_filter_critical").performClick()
     composeTestRule.waitForIdle()
 
-    val firstNodeId = result.report.nodes.first { it.isCriticalPath }.id
+    val firstNodeId = StaTableSorter.sortAndFilter(
+      nodes = result.report.nodes,
+      sortColumn = StaSortColumn.DELAY,
+      sortDirection = StaSortDirection.DESCENDING,
+      filter = StaRowFilter.CRITICAL_PATH,
+    ).first().id
     composeTestRule.onNodeWithTag("sta_row_$firstNodeId").performClick()
     composeTestRule.waitForIdle()
     assertEquals(firstNodeId, inspectedNodeId)

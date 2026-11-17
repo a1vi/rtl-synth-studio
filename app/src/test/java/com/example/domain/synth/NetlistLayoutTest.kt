@@ -257,4 +257,73 @@ class NetlistLayoutTest {
     assertTrue(jumpedPan.x.isFinite())
     assertTrue(jumpedPan.y.isFinite())
   }
+
+  @Test
+  fun computeRoutedSchematicLayout_producesOrthogonalSegmentsNoOverlapsAndSvgExport() {
+    val source = PresetRtlDesigns.templates.first().verilogCode
+    val report = (RtlSynthesisEngine.synthesize(
+      verilogSource = source,
+      library = TargetLibrary.ASAP7_7NM,
+      goal = OptimizationGoal.BALANCED,
+      clockPeriodNs = 2.0,
+    ) as SynthesisResult.Success).report
+
+    val graph = StructuralNetlistParser.buildSchematicGraph(report)
+    val routed = NetlistLayoutEngine.computeRoutedSchematicLayout(graph)
+
+    assertEquals(graph.cells.size, routed.placedCells.size)
+    assertTrue(routed.routedNets.isNotEmpty())
+
+    // 1. Verify no cell rectangles overlap
+    val placed = routed.placedCells.values.toList()
+    for (i in placed.indices) {
+      for (j in (i + 1) until placed.size) {
+        val a = placed[i]
+        val b = placed[j]
+        val overlaps = a.x < b.x + b.width && a.x + a.width > b.x &&
+          a.y < b.y + b.height && a.y + a.height > b.y
+        assertTrue("Cells ${a.cell.id} and ${b.cell.id} must not overlap", !overlaps)
+      }
+    }
+
+    // 2. Verify all net polyline segments are strictly 90-degree orthogonal (horizontal or vertical)
+    routed.routedNets.forEach { rNet ->
+      rNet.branches.forEach { branch ->
+        assertTrue(branch.points.size >= 2)
+        for (i in 0 until branch.points.lastIndex) {
+          val p0 = branch.points[i]
+          val p1 = branch.points[i + 1]
+          val isOrthogonal = kotlin.math.abs(p0.x - p1.x) < 0.01f || kotlin.math.abs(p0.y - p1.y) < 0.01f
+          assertTrue("Net ${rNet.net.name} segment ($p0 -> $p1) must be orthogonal", isOrthogonal)
+        }
+      }
+    }
+
+    // 3. Hit-test both cell and net
+    val firstCell = placed.first { !it.cell.category.isPort }
+    val hitCell = NetlistLayoutEngine.hitTestSchematicCell(
+      layout = routed,
+      canvasPoint = firstCell.center,
+      panOffset = Offset.Zero,
+      scale = 1f,
+    )
+    assertEquals(firstCell.cell.id, hitCell?.id)
+
+    val firstBranchPt = routed.routedNets.first().branches.first().points.first()
+    val hitNet = NetlistLayoutEngine.hitTestSchematicNet(
+      layout = routed,
+      canvasPoint = firstBranchPt,
+      panOffset = Offset.Zero,
+      scale = 1f,
+    )
+    assertNotNull(hitNet)
+
+    // 4. Verify SVG generation carries Cadence palette markers
+    val svg = com.example.ui.components.SchematicExporter.buildSvgString(routed, showNetLabels = true)
+    assertTrue(svg.contains("<svg"))
+    assertTrue(svg.contains("#000000"))
+    assertTrue(svg.contains("#55CC77"))
+    assertTrue(svg.contains("#FF8822"))
+    assertTrue(svg.contains("<polyline"))
+  }
 }

@@ -409,8 +409,8 @@ object VerilogSyntaxHighlighter {
     // VHDL control
     "process", "rising_edge", "falling_edge", "when", "others",
     // SDC commands
-    "create_clock", "set_input_delay", "set_output_delay", "set_clock_uncertainty",
-    "set_false_path", "get_ports", "get_clocks",
+    "create_clock", "set_input_delay", "set_output_delay", "set_load", "set_clock_uncertainty",
+    "set_false_path", "set_max_delay", "get_ports", "get_clocks", "all_inputs", "all_outputs",
   )
 
   fun lineRangeFor(source: String, oneBasedLine: Int): IntRange? {

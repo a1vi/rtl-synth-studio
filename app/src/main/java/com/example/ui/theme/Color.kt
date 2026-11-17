@@ -3,35 +3,35 @@ package com.example.ui.theme
 import androidx.compose.ui.graphics.Color
 
 // =====================================================================
-// Dark Industrial EDA Palette (Primary Experience)
-// Inspired by VS Code, Linear, GitHub Dark, and professional EDA suites
+// Dark Professional EDA Palette (Primary Experience)
+// Inspired by Cadence Virtuoso / Encounter RTL, Synopsys DC, and Vivado
 // =====================================================================
-val IndustrialBgDark = Color(0xFF0B1120)          // Deep navy background
-val IndustrialSurfaceDark = Color(0xFF111827)     // Secondary slate surface
-val IndustrialCardDark = Color(0xFF172235)        // Slightly elevated cards
-val IndustrialCodeBgDark = Color(0xFF080D1A)      // Darker distraction-free editor surface
-val IndustrialOutlineDark = Color(0xFF24324B)     // Thin understated divider / hairline border
+val IndustrialBgDark = Color(0xFF121417)          // Main dark charcoal background
+val IndustrialSurfaceDark = Color(0xFF1B1F24)     // Secondary background
+val IndustrialCardDark = Color(0xFF20252B)        // Panel background
+val IndustrialCodeBgDark = Color(0xFF0D0F12)      // Distraction-free RTL / log surface
+val IndustrialOutlineDark = Color(0xFF343B43)     // Subtle hairline border
 
-val ElectricBlueDark = Color(0xFF3B82F6)          // Primary electric blue accent
+val ElectricBlueDark = Color(0xFF3987F5)          // Primary accent blue (#3987F5)
 val ElectricBlueOnDark = Color(0xFFFFFFFF)
-val ElectricBlueContainerDark = Color(0xFF1E3A5F)
-val ElectricBlueOnContainerDark = Color(0xFFDBEAFE)
+val ElectricBlueContainerDark = Color(0xFF1B3355)
+val ElectricBlueOnContainerDark = Color(0xFFD8E8FF)
 
-val CyanHighlightDark = Color(0xFF22D3EE)         // Subtle cyan highlight
-val CyanOnDark = Color(0xFF05202B)
-val CyanContainerDark = Color(0xFF0E3A4A)
-val CyanOnContainerDark = Color(0xFFCFFAFE)
+val CyanHighlightDark = Color(0xFF38BDF8)         // Restrained engineering cyan accent
+val CyanOnDark = Color(0xFF071D2A)
+val CyanContainerDark = Color(0xFF143144)
+val CyanOnContainerDark = Color(0xFFD0F0FF)
 
-val EmeraldSuccessDark = Color(0xFF10B981)        // Success green
-val EmeraldContainerDark = Color(0xFF0A3326)
-val AmberWarningDark = Color(0xFFF59E0B)          // Warning amber
-val AmberContainerDark = Color(0xFF3F2806)
-val RedErrorDark = Color(0xFFEF4444)              // Error red
-val RedContainerDark = Color(0xFF451218)
-val RedOnContainerDark = Color(0xFFFEE2E2)
+val EmeraldSuccessDark = Color(0xFF2EA043)        // Engineering green
+val EmeraldContainerDark = Color(0xFF122C1D)
+val AmberWarningDark = Color(0xFFD29922)          // Engineering amber
+val AmberContainerDark = Color(0xFF34260C)
+val RedErrorDark = Color(0xFFF85149)              // Engineering red
+val RedContainerDark = Color(0xFF3D1618)
+val RedOnContainerDark = Color(0xFFFFDAD6)
 
-val TextPrimaryDark = Color(0xFFF8FAFC)           // Clean crisp white
-val TextSecondaryDark = Color(0xFF94A3B8)         // Muted gray-blue secondary text
+val TextPrimaryDark = Color(0xFFE8ECF1)           // Near-white primary text
+val TextSecondaryDark = Color(0xFF8F98A3)         // Muted gray secondary text
 
 // =====================================================================
 // Crisp Light Engineering Studio Palette

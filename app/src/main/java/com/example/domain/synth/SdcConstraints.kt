@@ -1,18 +1,28 @@
 package com.example.domain.synth
 
+import com.example.data.model.TargetLibrary
 import java.util.Locale
 
 data class SdcClock(
   val name: String,
   val periodNs: Double,
   val portName: String?,
-)
+) {
+  val frequencyMhz: Double
+    get() = if (periodNs > 0.0) 1000.0 / periodNs else 0.0
+}
 
 data class SdcIoDelay(
   val portPattern: String,
   val clockName: String?,
   val delayNs: Double,
   val isInput: Boolean,
+)
+
+data class SdcOutputLoad(
+  val portPattern: String,
+  val loadPf: Double,
+  val isPinLoad: Boolean = true,
 )
 
 enum class SdcExceptionKind {
@@ -34,6 +44,7 @@ data class SdcConstraintSet(
   val exceptions: List<SdcTimingException>,
   val clockUncertaintyNs: Double,
   val diagnostics: List<String>,
+  val outputLoads: List<SdcOutputLoad> = emptyList(),
 ) {
   val primaryClockPeriodNs: Double?
     get() = clocks.firstOrNull()?.periodNs
@@ -46,6 +57,11 @@ data class SdcConstraintSet(
   fun outputDelayForPort(portName: String): Double {
     val specific = ioDelays.lastOrNull { !it.isInput && matchesPattern(portName, it.portPattern) }
     return specific?.delayNs ?: 0.0
+  }
+
+  fun outputLoadForPort(portName: String): Double {
+    val specific = outputLoads.lastOrNull { matchesPattern(portName, it.portPattern) }
+    return specific?.loadPf ?: 0.0
   }
 
   fun isFalsePathEndpoint(endpointName: String, launchCandidates: List<String> = emptyList()): Boolean {
@@ -70,17 +86,24 @@ data class SdcConstraintSet(
   }
 
   val totalConstraintCount: Int
-    get() = clocks.size + ioDelays.size + exceptions.size + (if (clockUncertaintyNs > 0.0) 1 else 0)
+    get() = clocks.size + ioDelays.size + outputLoads.size + exceptions.size +
+      (if (clockUncertaintyNs > 0.0) 1 else 0)
 
   fun summaryLine(): String {
     if (totalConstraintCount == 0) return "No custom SDC constraints"
     val parts = mutableListOf<String>()
     if (clocks.isNotEmpty()) {
-      parts += clocks.joinToString(", ") { "${it.name}:${String.format(Locale.US, "%.2f", it.periodNs)}ns" }
+      parts += clocks.joinToString(", ") {
+        "${it.name}:${String.format(Locale.US, "%.2f", it.periodNs)}ns (${String.format(Locale.US, "%.0f", it.frequencyMhz)}MHz)"
+      }
     }
     val inCount = ioDelays.count { it.isInput }
     val outCount = ioDelays.count { !it.isInput }
     if (inCount > 0 || outCount > 0) parts += "${inCount}in/${outCount}out delays"
+    if (outputLoads.isNotEmpty()) {
+      val maxLoad = outputLoads.maxOf { it.loadPf }
+      parts += "${outputLoads.size} load (${String.format(Locale.US, "%.2f", maxLoad)}pF)"
+    }
     if (clockUncertaintyNs > 0.0) parts += "uncert=${String.format(Locale.US, "%.2f", clockUncertaintyNs)}ns"
     if (exceptions.isNotEmpty()) parts += "${exceptions.size} path exc"
     return parts.joinToString(" · ")
@@ -107,16 +130,33 @@ data class SdcConstraintSet(
 }
 
 /**
- * Synopsys Design Constraints (SDC) parser & default template generator.
+ * Synopsys Design Constraints (SDC) parser, serializer & default template generator.
  * Supports:
  * - create_clock -name <clk> -period <ns> [get_ports <port>]
  * - set_input_delay -clock <clk> <ns> [get_ports <pat>]
  * - set_output_delay -clock <clk> <ns> [get_ports <pat>]
+ * - set_load [-pin_load|-wire_load] <pF> [get_ports <pat>]
  * - set_clock_uncertainty <ns> [get_clocks ...]
  * - set_false_path [-from <pat>] [-to <pat>]
  * - set_max_delay <ns> [-from <pat>] [-to <pat>]
  */
 object SdcParser {
+
+  /**
+   * Computes output buffer RC transition delay (ns) for a capacitive load in picofarads (pF)
+   * calibrated per target process node / FPGA I/O driver strength.
+   */
+  fun outputLoadDelayNs(loadPf: Double, library: TargetLibrary): Double {
+    if (loadPf <= 0.0) return 0.0
+    val nsPerPf = when (library) {
+      TargetLibrary.ASAP7_7NM -> 0.28
+      TargetLibrary.ARTIX7_FPGA -> 0.34
+      TargetLibrary.NANGATE45_45NM -> 0.38
+      TargetLibrary.SKY130_130NM -> 0.52
+      TargetLibrary.GF180MCU_180NM -> 0.68
+    }
+    return (loadPf.coerceIn(0.0, 100.0) * nsPerPf)
+  }
 
   fun parse(sdcText: String, fallbackClockNs: Double): SdcConstraintSet {
     if (sdcText.isBlank()) {
@@ -127,11 +167,13 @@ object SdcParser {
         exceptions = emptyList(),
         clockUncertaintyNs = 0.0,
         diagnostics = emptyList(),
+        outputLoads = emptyList(),
       )
     }
 
     val clocks = mutableListOf<SdcClock>()
     val ioDelays = mutableListOf<SdcIoDelay>()
+    val outputLoads = mutableListOf<SdcOutputLoad>()
     val exceptions = mutableListOf<SdcTimingException>()
     var uncertainty = 0.0
     val diagnostics = mutableListOf<String>()
@@ -236,6 +278,50 @@ object SdcParser {
           }
         }
 
+        "set_load" -> {
+          var loadPf: Double? = null
+          var targetPat: String? = null
+          var isPinLoad = true
+          var i = 1
+          while (i < tokens.size) {
+            val tok = tokens[i]
+            when {
+              tok == "-pin_load" -> {
+                isPinLoad = true
+                i++
+              }
+              tok == "-wire_load" -> {
+                isPinLoad = false
+                i++
+              }
+              tok.startsWith("-") -> {
+                if (tok in setOf("-max", "-min", "-rise", "-fall", "-subtract_pin_load")) {
+                  i++
+                } else {
+                  i += 2
+                }
+              }
+              loadPf == null && tok.toDoubleOrNull() != null -> {
+                loadPf = tok.toDoubleOrNull()
+                i++
+              }
+              else -> {
+                targetPat = extractTargetPattern(tok) ?: tok
+                i++
+              }
+            }
+          }
+          if (loadPf == null) {
+            diagnostics += "SDC line $lineNo: Missing numeric capacitance value in set_load."
+          } else {
+            outputLoads += SdcOutputLoad(
+              portPattern = targetPat ?: "*",
+              loadPf = loadPf.coerceIn(0.0, 100.0),
+              isPinLoad = isPinLoad,
+            )
+          }
+        }
+
         "set_clock_uncertainty" -> {
           val valNum = tokens.drop(1).firstOrNull { !it.startsWith("-") && it.toDoubleOrNull() != null }?.toDoubleOrNull()
           if (valNum != null) {
@@ -319,8 +405,64 @@ object SdcParser {
       exceptions = exceptions,
       clockUncertaintyNs = uncertainty,
       diagnostics = diagnostics,
+      outputLoads = outputLoads,
     )
   }
+
+  fun serialize(
+    clocks: List<SdcClock>,
+    ioDelays: List<SdcIoDelay>,
+    outputLoads: List<SdcOutputLoad>,
+    clockUncertaintyNs: Double,
+    exceptions: List<SdcTimingException> = emptyList(),
+    moduleName: String? = null,
+  ): String = buildString {
+    if (!moduleName.isNullOrBlank()) {
+      appendLine("# SDC Constraints for $moduleName")
+    }
+    clocks.forEach { clk ->
+      val period = String.format(Locale.US, "%.2f", clk.periodNs.coerceIn(0.2, 500.0))
+      val portTarget = clk.portName?.takeIf { it.isNotBlank() } ?: clk.name
+      appendLine("create_clock -name ${clk.name} -period $period [get_ports $portTarget]")
+    }
+    if (clockUncertaintyNs > 0.0) {
+      val uncert = String.format(Locale.US, "%.2f", clockUncertaintyNs.coerceIn(0.0, 50.0))
+      val primaryName = clocks.firstOrNull()?.name ?: "*"
+      appendLine("set_clock_uncertainty $uncert [get_clocks $primaryName]")
+    }
+    val defaultClk = clocks.firstOrNull()?.name ?: "clk"
+    ioDelays.filter { it.isInput }.forEach { io ->
+      val clkRef = io.clockName?.takeIf { it.isNotBlank() } ?: defaultClk
+      val d = String.format(Locale.US, "%.2f", io.delayNs.coerceIn(0.0, 200.0))
+      appendLine("set_input_delay -clock $clkRef $d [get_ports ${io.portPattern.ifBlank { "*" }}]")
+    }
+    ioDelays.filter { !it.isInput }.forEach { io ->
+      val clkRef = io.clockName?.takeIf { it.isNotBlank() } ?: defaultClk
+      val d = String.format(Locale.US, "%.2f", io.delayNs.coerceIn(0.0, 200.0))
+      appendLine("set_output_delay -clock $clkRef $d [get_ports ${io.portPattern.ifBlank { "*" }}]")
+    }
+    outputLoads.forEach { load ->
+      val pf = String.format(Locale.US, "%.2f", load.loadPf.coerceIn(0.0, 100.0))
+      val pat = load.portPattern.ifBlank { "*" }
+      val flag = if (load.isPinLoad) "-pin_load " else "-wire_load "
+      appendLine("set_load $flag$pf [get_ports $pat]")
+    }
+    exceptions.forEach { ex ->
+      when (ex.kind) {
+        SdcExceptionKind.FALSE_PATH -> {
+          val fromStr = ex.fromPattern?.let { " -from [get_ports $it]" } ?: ""
+          val toStr = ex.toPattern?.let { " -to [get_ports $it]" } ?: ""
+          appendLine("set_false_path$fromStr$toStr")
+        }
+        SdcExceptionKind.MAX_DELAY -> {
+          val maxStr = String.format(Locale.US, "%.2f", (ex.maxDelayNs ?: 2.0).coerceIn(0.05, 500.0))
+          val fromStr = ex.fromPattern?.let { " -from [get_ports $it]" } ?: ""
+          val toStr = ex.toPattern?.let { " -to [get_ports $it]" } ?: ""
+          appendLine("set_max_delay $maxStr$fromStr$toStr")
+        }
+      }
+    }
+  }.trimEnd()
 
   fun generateDefaultSdc(
     moduleName: String,
@@ -352,6 +494,7 @@ object SdcParser {
       }
       if (outputs.isNotEmpty()) {
         appendLine("set_output_delay -clock $clkPort $outDelay [get_ports *]")
+        appendLine("set_load -pin_load 0.15 [get_ports *]")
       }
     }.trimEnd()
   }

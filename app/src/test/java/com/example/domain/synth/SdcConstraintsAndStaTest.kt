@@ -100,4 +100,86 @@ class SdcConstraintsAndStaTest {
     val reparsed = SdcParser.parse(updated, 2.0)
     assertEquals(4.2, reparsed.primaryClockPeriodNs ?: 0.0, 1e-4)
   }
+
+  @Test
+  fun sdcParser_parsesAndSerializesOutputLoads() {
+    val sdc = """
+      create_clock -name clk -period 2.50 [get_ports clk]
+      set_input_delay -clock clk 0.40 [get_ports data_*]
+      set_output_delay -clock clk 0.30 [get_ports *]
+      set_load -pin_load 1.25 [get_ports y]
+      set_load -wire_load 0.40 [get_ports dbg_*]
+    """.trimIndent()
+
+    val parsed = SdcParser.parse(sdc, fallbackClockNs = 2.0)
+    assertTrue("No diagnostics expected: ${parsed.diagnostics}", parsed.diagnostics.isEmpty())
+    assertEquals(2, parsed.outputLoads.size)
+    assertEquals(1.25, parsed.outputLoadForPort("y"), 1e-4)
+    assertEquals(0.40, parsed.outputLoadForPort("dbg_out"), 1e-4)
+    assertEquals(0.0, parsed.outputLoadForPort("unconstrained"), 1e-4)
+
+    val serialized = SdcParser.serialize(
+      clocks = parsed.clocks,
+      ioDelays = parsed.ioDelays,
+      outputLoads = parsed.outputLoads,
+      clockUncertaintyNs = parsed.clockUncertaintyNs,
+      exceptions = parsed.exceptions,
+      moduleName = "top",
+    )
+    val roundTripped = SdcParser.parse(serialized, fallbackClockNs = 2.0)
+    assertEquals(parsed.clocks.size, roundTripped.clocks.size)
+    assertEquals(1.25, roundTripped.outputLoadForPort("y"), 1e-4)
+    assertEquals(0.40, roundTripped.outputLoadForPort("dbg_out"), 1e-4)
+    assertEquals(0.40, roundTripped.inputDelayForPort("data_in"), 1e-4)
+  }
+
+  @Test
+  fun synthesisEngine_outputLoadIncreasesArrivalAndTightensWns() {
+    val rtl = """
+      module load_test (
+        input wire a,
+        input wire b,
+        output wire y
+      );
+        assign y = ~(a & b);
+      endmodule
+    """.trimIndent()
+
+    val noLoadSdc = "create_clock -name clk -period 2.00 [get_ports clk]"
+    val heavyLoadSdc = """
+      create_clock -name clk -period 2.00 [get_ports clk]
+      set_load -pin_load 2.50 [get_ports y]
+    """.trimIndent()
+
+    val baseReport = (RtlSynthesisEngine.synthesize(
+      verilogSource = rtl,
+      library = TargetLibrary.SKY130_130NM,
+      goal = OptimizationGoal.BALANCED,
+      clockPeriodNs = 2.0,
+      sdcText = noLoadSdc,
+    ) as SynthesisResult.Success).report
+
+    val loadedReport = (RtlSynthesisEngine.synthesize(
+      verilogSource = rtl,
+      library = TargetLibrary.SKY130_130NM,
+      goal = OptimizationGoal.BALANCED,
+      clockPeriodNs = 2.0,
+      sdcText = heavyLoadSdc,
+    ) as SynthesisResult.Success).report
+
+    val expectedExtraDelay = SdcParser.outputLoadDelayNs(2.50, TargetLibrary.SKY130_130NM)
+    assertTrue("Expected non-zero output load delay", expectedExtraDelay > 1.0)
+    assertEquals(2.50, loadedReport.maxOutputLoadPf, 1e-4)
+    assertEquals(
+      baseReport.criticalPathDelayNs + expectedExtraDelay,
+      loadedReport.criticalPathDelayNs,
+      1e-3,
+    )
+    assertTrue("Heavy output load must reduce WNS", loadedReport.wnsNs < baseReport.wnsNs - 1.0)
+
+    val staSummary = StaticTimingAnalyzer.analyze(loadedReport, layout = null)
+    val critStage = staSummary.paths.first().stages.last { it.gateType == GateType.OUTPUT_PORT }
+    assertEquals(expectedExtraDelay, critStage.netDelayNs, 1e-3)
+    assertEquals(expectedExtraDelay, critStage.incrementalDelayNs, 1e-3)
+  }
 }

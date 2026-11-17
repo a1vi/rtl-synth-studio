@@ -10,6 +10,8 @@ import com.example.data.model.RtlLanguage
 import com.example.data.model.SynthesisEngineProfile
 import com.example.data.model.SynthesisRun
 import com.example.data.model.TargetLibrary
+import com.example.domain.synth.DftConfig
+import com.example.domain.synth.DftScanStyle
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -31,6 +33,7 @@ data class LocalDraftSnapshot(
   val files: List<RtlFileEntry> = emptyList(),
   val activeFileId: String? = null,
   val coreUtilizationPercent: Int = 60,
+  val dftConfig: DftConfig = DftConfig(),
 )
 
 /**
@@ -73,6 +76,7 @@ class LocalWorkspaceStore(private val rootDir: File) {
         put("defaultEngine", settings.defaultEngine.id)
         put("aggressiveOptimization", settings.aggressiveOptimization)
         put("retainHierarchy", settings.retainHierarchy)
+        put("bitBlastGates", settings.bitBlastGates)
         put("defaultLibrary", settings.defaultLibrary.id)
         put("localBridgeEnabled", settings.localBridgeEnabled)
         put("localBridgeEndpoint", settings.localBridgeEndpoint)
@@ -99,6 +103,7 @@ class LocalWorkspaceStore(private val rootDir: File) {
         defaultEngine = SynthesisEngineProfile.fromId(obj.optString("defaultEngine", SynthesisEngineProfile.SILICON_FLOW.id)),
         aggressiveOptimization = obj.optBoolean("aggressiveOptimization", false),
         retainHierarchy = obj.optBoolean("retainHierarchy", true),
+        bitBlastGates = obj.optBoolean("bitBlastGates", false),
         defaultLibrary = TargetLibrary.fromId(obj.optString("defaultLibrary", TargetLibrary.ASAP7_7NM.id)),
         localBridgeEnabled = obj.optBoolean("localBridgeEnabled", false),
         localBridgeEndpoint = obj.optString("localBridgeEndpoint", "http://127.0.0.1:8765"),
@@ -124,6 +129,14 @@ class LocalWorkspaceStore(private val rootDir: File) {
         put("activeFileId", draft.activeFileId.orEmpty())
         put("files", serializeFiles(draft.files))
         put("coreUtilizationPercent", draft.coreUtilizationPercent)
+        put("dftScanEnabled", draft.dftConfig.scanInsertionEnabled)
+        put("dftScanStyle", draft.dftConfig.scanStyle.id)
+        put("dftChainCount", draft.dftConfig.targetChainCount)
+        put("dftMaxChainLength", draft.dftConfig.maxChainLength)
+        put("dftLockupLatches", draft.dftConfig.insertLockupLatches)
+        put("dftJtagTap", draft.dftConfig.insertJtagBoundaryTap)
+        put("dftMbistCollar", draft.dftConfig.insertMbistCollar)
+        put("dftAtpgMaxPatterns", draft.dftConfig.atpgMaxPatterns)
       }
       draftFile.writeText(obj.toString())
     }
@@ -148,6 +161,16 @@ class LocalWorkspaceStore(private val rootDir: File) {
         files = deserializeFiles(obj.optJSONArray("files")),
         activeFileId = obj.optString("activeFileId", "").ifBlank { null },
         coreUtilizationPercent = obj.optInt("coreUtilizationPercent", 60).coerceIn(30, 85),
+        dftConfig = DftConfig(
+          scanInsertionEnabled = obj.optBoolean("dftScanEnabled", false),
+          scanStyle = DftScanStyle.fromId(obj.optString("dftScanStyle", DftScanStyle.MUXED_D.id)),
+          targetChainCount = obj.optInt("dftChainCount", 1).coerceIn(1, 8),
+          maxChainLength = obj.optInt("dftMaxChainLength", 16).coerceIn(4, 64),
+          insertLockupLatches = obj.optBoolean("dftLockupLatches", true),
+          insertJtagBoundaryTap = obj.optBoolean("dftJtagTap", false),
+          insertMbistCollar = obj.optBoolean("dftMbistCollar", false),
+          atpgMaxPatterns = obj.optInt("dftAtpgMaxPatterns", 32).coerceIn(8, 128),
+        ),
       )
     }.getOrNull()
   }

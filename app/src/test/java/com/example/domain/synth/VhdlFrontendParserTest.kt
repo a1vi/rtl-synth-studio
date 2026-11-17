@@ -12,7 +12,7 @@ class VhdlFrontendParserTest {
 
   @Test
   fun vhdlPreset_detectsAndSynthesizesSequentialCounter() {
-    val vhdlPreset = PresetRtlDesigns.templates.first { it.name == "counter_4bit_vhdl" }
+    val vhdlPreset = TestRtlFixtures.counter4BitVhdl
     assertTrue(VhdlFrontendParser.looksLikeVhdl(vhdlPreset.verilogCode))
     assertFalse(VhdlFrontendParser.looksLikeVhdl("module plain(input a, output y); assign y = a; endmodule"))
 
@@ -34,6 +34,15 @@ class VhdlFrontendParserTest {
     assertTrue(report.seqCellCount >= 1)
     assertTrue(report.cellCount >= 1)
     assertEquals(SynthesisEngineProfile.AREA_COMPACTOR, report.engineProfile)
+
+    val hardVhdl = PresetRtlDesigns.templates.first { it.language == com.example.data.model.RtlLanguage.VHDL }
+    val hardSynth = RtlSynthesisEngine.synthesize(
+      verilogSource = hardVhdl.verilogCode,
+      library = hardVhdl.defaultLibrary,
+      goal = hardVhdl.defaultGoal,
+      clockPeriodNs = hardVhdl.defaultClockNs,
+    )
+    assertTrue("Expected hard VHDL preset synthesis success, got $hardSynth", hardSynth is SynthesisResult.Success)
   }
 
   @Test

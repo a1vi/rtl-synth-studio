@@ -61,6 +61,9 @@ fun SettingsScreen(
   onClearSynthesisCache: () -> Unit,
   onResetWorkspace: () -> Unit,
   modifier: Modifier = Modifier,
+  remoteWorkerStatus: String? = null,
+  isTestingRemoteWorker: Boolean = false,
+  onTestRemoteWorker: () -> Unit = {},
 ) {
   val eda = LocalEdaColors.current
 
@@ -78,7 +81,7 @@ fun SettingsScreen(
       ) {
         SettingSwitchRow(
           title = "Dark Industrial Theme",
-          subtitle = "Deep navy (#0B1120) canvas with electric blue & cyan syntax highlights",
+          subtitle = "Dark charcoal (#121417) EDA workspace with electric blue (#3987F5) accents",
           checked = settings.darkTheme,
           onCheckedChange = { enabled -> onUpdateSettings { it.copy(darkTheme = enabled) } },
           testTag = "setting_dark_theme_switch",
@@ -212,6 +215,13 @@ fun SettingsScreen(
           checked = settings.retainHierarchy,
           onCheckedChange = { enabled -> onUpdateSettings { it.copy(retainHierarchy = enabled) } },
         )
+        SettingSwitchRow(
+          title = "Bit-Blasted 1-Bit Gate View",
+          subtitle = "Decompose arithmetic (+, *, -) and wide muxes into 1-bit XOR2/AND2/OR2 chains",
+          checked = settings.bitBlastGates,
+          onCheckedChange = { enabled -> onUpdateSettings { it.copy(bitBlastGates = enabled) } },
+          testTag = "setting_bit_blast_switch",
+        )
       }
     }
 
@@ -300,11 +310,30 @@ fun SettingsScreen(
           OutlinedTextField(
             value = settings.localBridgeEndpoint,
             onValueChange = { url -> onUpdateSettings { it.copy(localBridgeEndpoint = url) } },
-            label = { Text("Local Bridge Endpoint URI") },
+            label = { Text("Remote OpenROAD / Yosys Worker URI") },
             singleLine = true,
             textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = JetBrainsMonoFamily),
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().testTag("remote_worker_uri_input"),
           )
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Text(
+              text = remoteWorkerStatus ?: "GET /health · POST /api/v1/flow",
+              style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+              modifier = Modifier.weight(1f).padding(end = 8.dp),
+            )
+            OutlinedButton(
+              onClick = onTestRemoteWorker,
+              enabled = !isTestingRemoteWorker,
+              modifier = Modifier.heightIn(min = 48.dp).testTag("settings_test_remote_worker_button"),
+            ) {
+              Text(if (isTestingRemoteWorker) "Pinging..." else "Test Worker", style = MaterialTheme.typography.labelMedium)
+            }
+          }
         }
       }
     }

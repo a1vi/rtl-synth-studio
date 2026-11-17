@@ -216,6 +216,8 @@ object RtlToGdsFlowEngine {
     existingReport: SynthesisReport? = null,
     startFromStageIndex: Int = 0,
     stepDelayMs: Long = 0L,
+    bitBlast: Boolean = false,
+    dftConfig: DftConfig = DftConfig(),
     onProgress: (RtlToGdsStageEvent) -> Unit,
   ): RtlToGdsStageEvent {
     val utilPct = coreUtilizationPercent.coerceIn(30, 85)
@@ -273,6 +275,8 @@ object RtlToGdsFlowEngine {
         sdcText = sdcText,
         engineProfile = engineProfile,
         topModuleName = topModuleOverride,
+        bitBlast = bitBlast,
+        dftConfig = dftConfig,
       )
       if (res is SynthesisResult.Success) {
         activeReport = res.report
@@ -296,6 +300,8 @@ object RtlToGdsFlowEngine {
         sdcText = sdcText,
         engineProfile = engineProfile,
         topModuleName = topModuleOverride,
+        bitBlast = bitBlast,
+        dftConfig = dftConfig,
       )
       val dur = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
 
@@ -321,13 +327,22 @@ object RtlToGdsFlowEngine {
         is SynthesisResult.Success -> {
           activeReport = synthRes.report
           logs += synthRes.report.synthesisLog
+          val dft = synthRes.report.dftReport
+          val dftNote = if (dft != null && dft.scanInserted) {
+            "DFT: ${dft.scanChains.size} scan chain(s) · ${"%.1f".format(Locale.US, dft.stuckAtCoveragePct)}% SA cov"
+          } else if (dft != null) {
+            "ATPG SA cov: ${"%.1f".format(Locale.US, dft.stuckAtCoveragePct)}%"
+          } else {
+            null
+          }
           stages[0] = stages[0].copy(
             status = FlowStageStatus.PASSED,
             durationMs = dur,
             headlineMetric = "${synthRes.report.cellCount} cells · ${"%.1f".format(Locale.US, synthRes.report.totalAreaUm2)} µm²",
-            details = listOf(
+            details = listOfNotNull(
               "Comb: ${synthRes.report.combCellCount} · Seq: ${synthRes.report.seqCellCount}",
               "Pre-opt: ${synthRes.report.preOptCellCount} -> Post-opt: ${synthRes.report.postOptCellCount}",
+              dftNote,
             ),
           )
           logs += "[STAGE 1/7] Synthesis passed (${stages[0].headlineMetric}) in ${dur}ms."
@@ -550,6 +565,7 @@ object RtlToGdsFlowEngine {
       clockPeriodNs = clockPeriodNs,
       coreUtilizationPercent = utilPct,
       sdcText = sdcText,
+      dftReport = report.dftReport,
     )
     val layoutSnapshot = PhysicalLayoutSnapshot(
       moduleName = effectiveName,
@@ -1064,6 +1080,7 @@ object RtlToGdsFlowEngine {
     clockPeriodNs: Double,
     coreUtilizationPercent: Int,
     sdcText: String,
+    dftReport: DftReport? = null,
   ): String {
     val pdkTag = library.id.lowercase(Locale.US)
     return buildString {
@@ -1078,11 +1095,20 @@ object RtlToGdsFlowEngine {
       appendLine("synth -top \$DESIGN_NAME")
       appendLine("dfflibmap -liberty \${PDK_DIR}/$pdkTag.lib")
       appendLine("abc -D [expr {\$CLOCK_PERIOD_NS * 1000.0}] -liberty \${PDK_DIR}/$pdkTag.lib")
+      if (dftReport != null && dftReport.scanInserted) {
+        appendLine()
+        appendLine("# 1b. DFT Scan Insertion (${dftReport.config.scanStyle.displayName})")
+        appendLine("# Scan chains: ${dftReport.scanChains.size} | Scan flops: ${dftReport.scanReplacedElements} | Lockup latches: ${dftReport.lockupLatchCount}")
+        appendLine("read_scandef ${moduleName}_scanchains.def")
+      }
       appendLine("write_verilog -noattr ${moduleName}_synth.v")
       appendLine()
       appendLine("# 2. OpenROAD Floorplan -> Place -> CTS -> Route")
       appendLine("initialize_floorplan -utilization \$CORE_UTILIZATION -aspect_ratio 1.0 -core_space 4.0")
       appendLine("global_placement -density [expr {\$CORE_UTILIZATION / 100.0}]")
+      if (dftReport != null && dftReport.scanInserted) {
+        appendLine("repair_design")
+      }
       appendLine("detailed_placement")
       appendLine("clock_tree_synthesis -buf_list \"clkbuf_1 clkbuf_2 clkbuf_4\"")
       appendLine("global_route -congestion_iterations 40")

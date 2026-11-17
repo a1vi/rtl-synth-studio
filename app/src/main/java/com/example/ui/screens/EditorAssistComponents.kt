@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Close
@@ -89,6 +90,16 @@ internal object EditorCodeHelpers {
     val indent = baseIndent + extra
     if (indent.isEmpty()) return null
     return newText.substring(0, insertIdx + 1) + indent + newText.substring(insertIdx + 1)
+  }
+
+  fun offsetForLine(text: String, oneBasedLine: Int): Int {
+    if (oneBasedLine <= 1 || text.isEmpty()) return 0
+    var currentLine = 1
+    for (i in text.indices) {
+      if (currentLine >= oneBasedLine) return i
+      if (text[i] == '\n') currentLine++
+    }
+    return text.length
   }
 
   fun checkBracketBalance(source: String): Pair<Boolean, String> {
@@ -332,6 +343,7 @@ internal fun ProjectExplorerAndOutlineSheet(
     Column(
       modifier = Modifier
         .fillMaxWidth()
+        .verticalScroll(rememberScrollState())
         .padding(horizontal = 16.dp, vertical = 8.dp),
       verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -505,4 +517,202 @@ private fun AddFileDialog(
       TextButton(onClick = onDismiss) { Text("Cancel") }
     },
   )
+}
+
+internal data class RtlSnippetTemplate(
+  val id: String,
+  val title: String,
+  val badge: String,
+  val summary: String,
+  val code: String,
+)
+
+internal val RtlQuickTemplates = listOf(
+  RtlSnippetTemplate(
+    id = "always_ff",
+    title = "always_ff Synchronous Register",
+    badge = "SV",
+    summary = "Clocked flip-flop block with synchronous reset and enable",
+    code = """
+always_ff @(posedge clk) begin
+  if (rst) begin
+    q <= '0;
+  end else if (en) begin
+    q <= d;
+  end
+end
+""".trimIndent(),
+  ),
+  RtlSnippetTemplate(
+    id = "fsm_3state",
+    title = "3-State SystemVerilog FSM",
+    badge = "FSM",
+    summary = "typedef enum state machine with next-state & output decode",
+    code = """
+typedef enum logic [1:0] { IDLE = 2'd0, ACTIVE = 2'd1, DONE = 2'd2 } fsm_state_t;
+fsm_state_t state, next_state;
+
+always_ff @(posedge clk) begin
+  if (rst) state <= IDLE;
+  else state <= next_state;
+end
+
+always_comb begin
+  next_state = state;
+  case (state)
+    IDLE:   if (start) next_state = ACTIVE;
+    ACTIVE: if (ready) next_state = DONE;
+    DONE:   next_state = IDLE;
+    default: next_state = IDLE;
+  endcase
+end
+""".trimIndent(),
+  ),
+  RtlSnippetTemplate(
+    id = "axi_lite_ports",
+    title = "AXI4-Lite Slave Port Header",
+    badge = "AXI",
+    summary = "Synthesizable AXI4-Lite write/read channel port declarations",
+    code = """
+module axi_lite_slave #(
+  parameter ADDR_W = 8,
+  parameter DATA_W = 32
+) (
+  input  logic              aclk,
+  input  logic              aresetn,
+  input  logic [ADDR_W-1:0] s_axi_awaddr,
+  input  logic              s_axi_awvalid,
+  output logic              s_axi_awready,
+  input  logic [DATA_W-1:0] s_axi_wdata,
+  input  logic              s_axi_wvalid,
+  output logic              s_axi_wready,
+  input  logic [ADDR_W-1:0] s_axi_araddr,
+  input  logic              s_axi_arvalid,
+  output logic              s_axi_arready,
+  output logic [DATA_W-1:0] s_axi_rdata,
+  output logic              s_axi_rvalid
+);
+""".trimIndent(),
+  ),
+  RtlSnippetTemplate(
+    id = "gen_for",
+    title = "Parameterized Generate-For Array",
+    badge = "GEN",
+    summary = "Multi-lane hardware replication with genvar",
+    code = """
+genvar gi;
+generate
+  for (gi = 0; gi < LANES; gi = gi + 1) begin : gen_lane
+    assign lane_out[gi] = lane_in[gi] ^ mask[gi];
+  end
+endgenerate
+""".trimIndent(),
+  ),
+  RtlSnippetTemplate(
+    id = "assert_display",
+    title = "Assert & \$display Check",
+    badge = "SIM",
+    summary = "Cycle-accurate simulation assertion & console log",
+    code = """
+always @(posedge clk) begin
+  if (!rst) begin
+    assert (count <= 8'hFF);
+    ${'$'}display("cyc_val=%0d", count);
+  end
+end
+""".trimIndent(),
+  ),
+  RtlSnippetTemplate(
+    id = "dft_scan_mux",
+    title = "DFT Scan-Muxed DFF Slice",
+    badge = "DFT",
+    summary = "Explicit test_mode / scan_en flip-flop stage for scan-shift verification",
+    code = """
+always_ff @(posedge clk) begin
+  if (rst) begin
+    scan_q <= 1'b0;
+  end else if (scan_en) begin
+    scan_q <= scan_in;
+  end else begin
+    scan_q <= func_d;
+  end
+end
+""".trimIndent(),
+  ),
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun QuickTemplateDrawerSheet(
+  onInsertTemplate: (String) -> Unit,
+  onDismiss: () -> Unit,
+) {
+  val eda = LocalEdaColors.current
+  ModalBottomSheet(
+    onDismissRequest = onDismiss,
+    containerColor = MaterialTheme.colorScheme.surface,
+  ) {
+    Column(
+      modifier = Modifier
+        .fillMaxWidth()
+        .verticalScroll(rememberScrollState())
+        .padding(horizontal = 16.dp, vertical = 8.dp)
+        .testTag("editor_template_sheet"),
+      verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        Icon(Icons.Rounded.Code, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+        Text("Quick-Insert RTL Templates", style = MaterialTheme.typography.titleMedium)
+      }
+      Text(
+        text = "Tap any synthesizable skeleton below to insert at the editor cursor.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+      RtlQuickTemplates.forEach { tpl ->
+        EdaSurfaceCard(
+          onClick = {
+            onInsertTemplate(tpl.code + "\n")
+            onDismiss()
+          },
+          elevated = true,
+          modifier = Modifier
+            .fillMaxWidth()
+            .testTag("template_item_${tpl.id}"),
+        ) {
+          Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Text(
+                text = tpl.title,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurface,
+              )
+              EdaStatusPill(
+                text = tpl.badge,
+                color = eda.cyanHighlight,
+                containerColor = eda.cyanContainer,
+              )
+            }
+            Text(
+              text = tpl.summary,
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+          }
+        }
+      }
+      Spacer(Modifier.height(16.dp))
+    }
+  }
 }

@@ -50,6 +50,21 @@ data class SignalTrace(
   }
 }
 
+data class SimConsoleEntry(
+  val cycle: Int,
+  val line: Int,
+  val text: String,
+)
+
+data class SimAssertionResult(
+  val line: Int,
+  val label: String,
+  val passedCount: Int,
+  val failedCycles: List<Int>,
+) {
+  val isPassed: Boolean get() = failedCycles.isEmpty()
+}
+
 data class SimulationResult(
   val moduleName: String,
   val cycleCount: Int,
@@ -57,6 +72,10 @@ data class SimulationResult(
   val resetPort: String?,
   val traces: List<SignalTrace>,
   val warnings: List<String> = emptyList(),
+  val consoleLogs: List<SimConsoleEntry> = emptyList(),
+  val assertions: List<SimAssertionResult> = emptyList(),
+  val executionDurationMs: Long = 0L,
+  val engineLabel: String = "On-Device Cycle Sim",
 )
 
 /**
@@ -72,6 +91,7 @@ object RtlSimulator {
     patternOverrides: Map<String, StimulusPattern> = emptyMap(),
     customValueOverrides: Map<Pair<String, Int>, Long> = emptyMap(),
   ): SimulationResult {
+    val startedNs = System.nanoTime()
     val top = design.topModule
     val safeCycles = cycleCount.coerceIn(4, 32)
     val warnings = mutableListOf<String>()
@@ -98,8 +118,10 @@ object RtlSimulator {
       traceCollectors.putIfAbsent(sig.name, ArrayList(safeCycles))
     }
 
-    // Track submodule persistent states across cycles
+    // Track submodule persistent states, procedural console logs & assertions across cycles
     val subModuleStates = mutableMapOf<String, MutableMap<String, Long>>()
+    val consoleLogs = mutableListOf<SimConsoleEntry>()
+    val assertionStats = linkedMapOf<Int, Pair<Int, MutableList<Int>>>() // line -> (passCount, failCycles)
 
     for (cycle in 0 until safeCycles) {
       // 1. Apply primary input stimuli for this cycle
@@ -131,6 +153,22 @@ object RtlSimulator {
         subModuleStates = subModuleStates,
       )
 
+      // Capture combinational block $display and assertions after convergence
+      top.alwaysBlocks.filter { !it.isSequential }.forEach { block ->
+        val dummyOut = linkedMapOf<String, Long>()
+        execStmts(
+          stmts = block.statements,
+          env = signalValues,
+          widths = widths,
+          blockingOut = dummyOut,
+          nonBlockingOut = dummyOut,
+          isSequential = false,
+          cycle = cycle,
+          consoleLogs = consoleLogs,
+          assertionStats = assertionStats,
+        )
+      }
+
       // 3. Record cycle waveform sample (before clock edge updates registered Q for next cycle)
       traceCollectors.forEach { (sigName, list) ->
         val w = widths[sigName] ?: 1
@@ -148,6 +186,9 @@ object RtlSimulator {
           blockingOut = blockNext,
           nonBlockingOut = nextRegUpdates,
           isSequential = true,
+          cycle = cycle,
+          consoleLogs = consoleLogs,
+          assertionStats = assertionStats,
         )
       }
       nextRegUpdates.forEach { (name, value) ->
@@ -174,6 +215,16 @@ object RtlSimulator {
       warnings += "Module '${top.name}' has no observable ports or signals to trace."
     }
 
+    val assertionResults = assertionStats.entries.map { (line, stats) ->
+      SimAssertionResult(
+        line = line,
+        label = "assert @ line $line",
+        passedCount = stats.first,
+        failedCycles = stats.second.toList(),
+      )
+    }
+
+    val elapsedMs = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
     return SimulationResult(
       moduleName = top.name,
       cycleCount = safeCycles,
@@ -181,6 +232,10 @@ object RtlSimulator {
       resetPort = resetPort,
       traces = traces,
       warnings = warnings,
+      consoleLogs = consoleLogs.take(120),
+      assertions = assertionResults,
+      executionDurationMs = elapsedMs,
+      engineLabel = "On-Device Cycle Sim",
     )
   }
 
@@ -190,6 +245,7 @@ object RtlSimulator {
     patternOverrides: Map<String, StimulusPattern> = emptyMap(),
     customValueOverrides: Map<Pair<String, Int>, Long> = emptyMap(),
   ): SimulationResult {
+    val startedNs = System.nanoTime()
     val safeCycles = cycleCount.coerceIn(4, 32)
     val inPorts = report.ports.filter { it.direction == PortDirection.INPUT || it.direction == PortDirection.INOUT }
     val outPorts = report.ports.filter { it.direction == PortDirection.OUTPUT }
@@ -276,6 +332,7 @@ object RtlSimulator {
       }
     }
 
+    val elapsedMs = ((System.nanoTime() - startedNs) / 1_000_000L).coerceAtLeast(1L)
     return SimulationResult(
       moduleName = report.moduleName,
       cycleCount = safeCycles,
@@ -293,7 +350,71 @@ object RtlSimulator {
           values = vals,
         )
       },
+      executionDurationMs = elapsedMs,
+      engineLabel = "Structural Netlist Sim",
     )
+  }
+
+  fun exportVcd(
+    simulation: SimulationResult,
+    clockPeriodNs: Double = 10.0,
+  ): String {
+    val sb = StringBuilder()
+    val safePeriodPs = ((clockPeriodNs.coerceAtLeast(0.2)) * 1000.0).toLong().coerceAtLeast(100L)
+    sb.appendLine("\$date")
+    sb.appendLine("  RTL Synth Studio IEEE-1364 VCD Export")
+    sb.appendLine("\$end")
+    sb.appendLine("\$version")
+    sb.appendLine("  ${simulation.engineLabel}")
+    sb.appendLine("\$end")
+    sb.appendLine("\$timescale 1ps \$end")
+    sb.appendLine("\$scope module ${simulation.moduleName.ifBlank { "top" }} \$end")
+
+    val ids = simulation.traces.indices.map { idx ->
+      val first = ('!' + (idx % 90))
+      val second = if (idx >= 90) ('!' + (idx / 90)).toString() else ""
+      "$first$second"
+    }
+    simulation.traces.forEachIndexed { idx, trace ->
+      val varType = if (trace.isSequentialReg) "reg" else "wire"
+      val width = trace.width.coerceAtLeast(1)
+      sb.appendLine("\$var $varType $width ${ids[idx]} ${trace.name} \$end")
+    }
+    sb.appendLine("\$upscope \$end")
+    sb.appendLine("\$enddefinitions \$end")
+    sb.appendLine("\$dumpvars")
+    simulation.traces.forEachIndexed { idx, trace ->
+      val v = maskValue(trace.values.firstOrNull() ?: 0L, trace.width)
+      if (trace.width <= 1) {
+        sb.appendLine("${v and 1L}${ids[idx]}")
+      } else {
+        sb.appendLine("b${v.toString(2).padStart(trace.width.coerceAtMost(64), '0')} ${ids[idx]}")
+      }
+    }
+    sb.appendLine("\$end")
+
+    for (c in 1 until simulation.cycleCount) {
+      val timePs = c * safePeriodPs
+      val changes = buildList {
+        simulation.traces.forEachIndexed { idx, trace ->
+          val prev = maskValue(trace.values.getOrElse(c - 1) { 0L }, trace.width)
+          val curr = maskValue(trace.values.getOrElse(c) { 0L }, trace.width)
+          if (curr != prev) {
+            if (trace.width <= 1) {
+              add("${curr and 1L}${ids[idx]}")
+            } else {
+              add("b${curr.toString(2).padStart(trace.width.coerceAtMost(64), '0')} ${ids[idx]}")
+            }
+          }
+        }
+      }
+      if (changes.isNotEmpty()) {
+        sb.appendLine("#$timePs")
+        changes.forEach { sb.appendLine(it) }
+      }
+    }
+    sb.appendLine("#${simulation.cycleCount * safePeriodPs}")
+    return sb.toString()
   }
 
   private fun evaluateCombinationalNetwork(
@@ -389,6 +510,9 @@ object RtlSimulator {
     blockingOut: MutableMap<String, Long>,
     nonBlockingOut: MutableMap<String, Long>,
     isSequential: Boolean,
+    cycle: Int = -1,
+    consoleLogs: MutableList<SimConsoleEntry>? = null,
+    assertionStats: MutableMap<Int, Pair<Int, MutableList<Int>>>? = null,
   ) {
     val localEnv = env.toMutableMap()
     blockingOut.forEach { (k, v) -> localEnv[k] = v }
@@ -418,7 +542,7 @@ object RtlSimulator {
           val cond = evalExpr(stmt.cond, localEnv, widths) != 0L
           val branch = if (cond) stmt.thenBranch else stmt.elseBranch
           if (branch.isNotEmpty()) {
-            execStmts(branch, localEnv, widths, blockingOut, nonBlockingOut, isSequential)
+            execStmts(branch, localEnv, widths, blockingOut, nonBlockingOut, isSequential, cycle, consoleLogs, assertionStats)
           }
         }
         is VerilogStmt.CaseStmt -> {
@@ -427,9 +551,42 @@ object RtlSimulator {
             pats.any { evalExpr(it, localEnv, widths) == selVal }
           }?.second ?: stmt.defaultBranch
           if (matched.isNotEmpty()) {
-            execStmts(matched, localEnv, widths, blockingOut, nonBlockingOut, isSequential)
+            execStmts(matched, localEnv, widths, blockingOut, nonBlockingOut, isSequential, cycle, consoleLogs, assertionStats)
           }
         }
+        is VerilogStmt.Display -> {
+          if (cycle >= 0 && consoleLogs != null) {
+            val evaluatedArgs = stmt.args.map { evalExpr(it, localEnv, widths) }
+            val text = formatVerilogDisplay(stmt.format, evaluatedArgs)
+            consoleLogs += SimConsoleEntry(cycle = cycle, line = stmt.line, text = text)
+          }
+        }
+        is VerilogStmt.AssertStmt -> {
+          if (cycle >= 0 && assertionStats != null) {
+            val passed = evalExpr(stmt.cond, localEnv, widths) != 0L
+            val cur = assertionStats.getOrPut(stmt.line) { 0 to mutableListOf() }
+            if (passed) {
+              assertionStats[stmt.line] = (cur.first + 1) to cur.second
+            } else {
+              cur.second += cycle
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private fun formatVerilogDisplay(format: String, args: List<Long>): String {
+    if (format.isBlank()) return args.joinToString(" ") { it.toString() }
+    var argIdx = 0
+    val regex = Regex("""%0?[dDhHxXoObBsStT]""")
+    return regex.replace(format) { match ->
+      val v = args.getOrNull(argIdx++) ?: 0L
+      when (match.value.lowercase(Locale.ROOT).last()) {
+        'h', 'x' -> v.toString(16).uppercase(Locale.ROOT)
+        'b' -> v.toString(2)
+        'o' -> v.toString(8)
+        else -> v.toString(10)
       }
     }
   }
@@ -589,6 +746,7 @@ object RtlSimulator {
           s.branches.forEach { (_, body) -> collectAssignedTargets(body, out) }
           collectAssignedTargets(s.defaultBranch, out)
         }
+        is VerilogStmt.Display, is VerilogStmt.AssertStmt -> Unit
       }
     }
   }

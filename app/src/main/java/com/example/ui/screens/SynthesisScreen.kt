@@ -26,17 +26,24 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.FactCheck
+import androidx.compose.material.icons.rounded.AccountTree
+import androidx.compose.material.icons.rounded.Analytics
 import androidx.compose.material.icons.rounded.Cancel
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.FileDownload
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.HourglassEmpty
+import androidx.compose.material.icons.rounded.Hub
 import androidx.compose.material.icons.rounded.Memory
+import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PauseCircleOutline
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Share
@@ -56,6 +63,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -81,17 +89,29 @@ import com.example.data.model.OptimizationGoal
 import com.example.data.model.RtlLanguage
 import com.example.data.model.SynthesisEngineProfile
 import com.example.data.model.TargetLibrary
+import com.example.domain.synth.DftConfig
+import com.example.domain.synth.DftScanStyle
 import com.example.domain.synth.FlowStageState
 import com.example.domain.synth.FlowStageStatus
+import com.example.domain.synth.LecOverallStatus
+import com.example.domain.synth.PdkCatalogManager
 import com.example.domain.synth.PhysicalLayoutSnapshot
+import com.example.domain.synth.SdcParser
+import com.example.domain.synth.StaticTimingAnalyzer
 import com.example.domain.synth.SynthesisResult
+import com.example.ui.components.EdaCompactMetric
+import com.example.ui.components.EdaPanelHeader
 import com.example.ui.components.EdaSectionHeader
 import com.example.ui.components.EdaStatusPill
 import com.example.ui.components.EdaSurfaceCard
 import com.example.ui.components.ExportShareHelper
+import com.example.ui.components.RtlDrcPreSynthCard
+import com.example.ui.components.TimingViolationCalloutStrip
+import com.example.ui.components.VisualSdcEditorCard
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.LocalEdaColors
 import com.example.ui.viewmodel.WorkbenchUiState
+import java.io.InputStream
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -116,11 +136,29 @@ fun SynthesisScreen(
   onCoreUtilizationChange: (Int) -> Unit = {},
   onCancelFlow: () -> Unit = {},
   onResumeFlow: () -> Unit = {},
+  bitBlastGates: Boolean = false,
+  onToggleBitBlastGates: () -> Unit = {},
+  onStartPdkDownload: (String, String?) -> Unit = { _, _ -> },
+  onPausePdkDownload: () -> Unit = {},
+  onCancelPdkDownload: () -> Unit = {},
+  onImportLocalPdk: (String, InputStream) -> Unit = { _, _ -> },
+  localBridgeEnabled: Boolean = false,
+  localBridgeEndpoint: String = "http://127.0.0.1:8765",
+  onTestRemoteWorker: () -> Unit = {},
+  onRunRemoteWorker: () -> Unit = {},
+  onToggleDftScan: () -> Unit = {},
+  onUpdateDftConfig: ((DftConfig) -> DftConfig) -> Unit = {},
+  onOpenSchematic: () -> Unit = {},
+  onOpenAnalysis: () -> Unit = {},
+  onOpenFormalLec: () -> Unit = onOpenAnalysis,
+  onRunRtlDrc: () -> Unit = {},
+  onJumpToDrcLine: (Int) -> Unit = { onJumpToEditor() },
 ) {
   val eda = LocalEdaColors.current
   val context = LocalContext.current
   val clipboard = LocalClipboardManager.current
   var showAdvancedSdc by rememberSaveable { mutableStateOf(false) }
+  var showPdkManager by rememberSaveable { mutableStateOf(false) }
   var logFilter by rememberSaveable { mutableStateOf(LogFilter.ALL) }
   val activeLayout = state.physicalLayout
   val savePngLauncher = rememberLauncherForActivityResult(
@@ -134,6 +172,20 @@ fun SynthesisScreen(
         onNotify("Saved KLayout GDSII snapshot PNG (${png.size / 1024} KB).")
       }.onFailure { err ->
         onNotify("PNG save failed: ${err.localizedMessage ?: "error"}")
+      }
+    }
+  }
+  val importPdkLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.OpenDocument(),
+  ) { uri: Uri? ->
+    if (uri != null) {
+      val name = uri.lastPathSegment?.substringAfterLast('/') ?: "custom_pdk.lef"
+      runCatching {
+        val stream = context.contentResolver.openInputStream(uri)
+          ?: throw IllegalStateException("Cannot open selected .lef/.lib file.")
+        onImportLocalPdk(name, stream)
+      }.onFailure { err ->
+        onNotify("PDK import failed: ${err.localizedMessage ?: "error"}")
       }
     }
   }
@@ -177,6 +229,16 @@ fun SynthesisScreen(
     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
     verticalArrangement = Arrangement.spacedBy(14.dp),
   ) {
+    // =========================================================================
+    // SECTION 1: EXECUTION & RUN CONTROL
+    // =========================================================================
+    item {
+      EdaSectionHeader(
+        title = "1. Execution & Flow Control",
+        subtitle = "Run RTL-to-GDSII compilation, pause/resume stages, and inspect telemetry",
+      )
+    }
+
     // 1. Primary Run Bar & Progress Status
     item {
       EdaSurfaceCard(modifier = Modifier.fillMaxWidth()) {
@@ -346,6 +408,7 @@ fun SynthesisScreen(
             ) {
               if (pdk != null) {
                 Surface(
+                  onClick = { showPdkManager = !showPdkManager },
                   color = eda.elevatedCard,
                   shape = MaterialTheme.shapes.small,
                   border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = 0.55f)),
@@ -360,9 +423,11 @@ fun SynthesisScreen(
                         modifier = Modifier.size(14.dp),
                       )
                       Text(
-                        text = if (pdk.isVerified) "PDK Verified" else "PDK Check Failed",
+                        text = if (pdk.customCellCount > 0) "${pdk.customCellCount} PDK Cells" else if (pdk.isVerified) "PDK Verified" else "PDK Check",
                         style = MaterialTheme.typography.labelSmall,
                         color = if (pdk.isVerified) eda.success else eda.error,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                       )
                     }
                     Text(
@@ -411,6 +476,362 @@ fun SynthesisScreen(
                       overflow = TextOverflow.Ellipsis,
                     )
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 1c. Pre-Synthesis RTL Design Rule Check (DRC)
+    item {
+      RtlDrcPreSynthCard(
+        drcReport = state.rtlDrcReport,
+        hasParseError = state.parseError != null,
+        onRunDrcScan = onRunRtlDrc,
+        onJumpToLine = onJumpToDrcLine,
+      )
+    }
+
+    // =========================================================================
+    // SECTION 2: CONFIGURATION (RTL, PDK, TIMING, DFT)
+    // =========================================================================
+    item {
+      EdaSectionHeader(
+        title = "2. Configuration",
+        subtitle = "Target top module, PDK cell library, SDC constraints & DFT scan setup",
+      )
+    }
+
+    // 1b-2. Real PDK Downloader & Local .LEF/.LIB Importer Card
+    item {
+      val pdk = state.pdkPackageStatus
+      EdaSurfaceCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+          modifier = Modifier.padding(14.dp),
+          verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+          Surface(
+            onClick = { showPdkManager = !showPdkManager },
+            color = eda.elevatedCard,
+            shape = MaterialTheme.shapes.small,
+            border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = 0.6f)),
+            modifier = Modifier.fillMaxWidth().testTag("pdk_manager_toggle"),
+          ) {
+            Row(
+              modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Rounded.CloudDownload, contentDescription = null, tint = eda.cyanHighlight, modifier = Modifier.size(16.dp))
+                Text("Real PDK Downloader & .LEF / .LIB Importer", style = MaterialTheme.typography.labelLarge)
+              }
+              Icon(
+                imageVector = if (showPdkManager) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                contentDescription = null,
+              )
+            }
+          }
+
+          if (showPdkManager) {
+            var pdkUrl by remember(state.targetLibrary) {
+              mutableStateOf(PdkCatalogManager.defaultSourceUrl(state.targetLibrary))
+            }
+            var expectedSha by remember(state.targetLibrary) { mutableStateOf("") }
+            val dl = state.pdkDownloadProgress
+            Surface(
+              color = eda.codeSurface,
+              shape = MaterialTheme.shapes.small,
+              border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = 0.65f)),
+              modifier = Modifier.fillMaxWidth().testTag("pdk_manager_panel"),
+            ) {
+              Column(
+                modifier = Modifier.padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
+                if (pdk != null) {
+                  Text(
+                    text = pdk.ruleSummary,
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                    color = eda.cyanHighlight,
+                  )
+                }
+                OutlinedTextField(
+                  value = pdkUrl,
+                  onValueChange = { pdkUrl = it },
+                  label = { Text("PDK .lef / .lib Mirror URL") },
+                  singleLine = true,
+                  textStyle = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                  modifier = Modifier.fillMaxWidth().testTag("pdk_url_input"),
+                )
+                OutlinedTextField(
+                  value = expectedSha,
+                  onValueChange = { expectedSha = it },
+                  label = { Text("Optional Expected SHA-256 (64 hex chars)") },
+                  singleLine = true,
+                  textStyle = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                  modifier = Modifier.fillMaxWidth().testTag("pdk_sha_input"),
+                )
+                if (dl != null) {
+                  if (dl.isDownloading) {
+                    if (dl.totalBytes > 0L) {
+                      LinearProgressIndicator(
+                        progress = { dl.fraction },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = eda.cyanHighlight,
+                      )
+                    } else {
+                      LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = eda.cyanHighlight,
+                      )
+                    }
+                  }
+                  Text(
+                    text = dl.statusMessage,
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                    color = if (dl.error != null) eda.error else eda.cyanHighlight,
+                  )
+                }
+                Row(
+                  modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                  if (dl?.isDownloading == true) {
+                    OutlinedButton(
+                      onClick = onPausePdkDownload,
+                      modifier = Modifier.heightIn(min = 48.dp).testTag("pdk_pause_button"),
+                    ) {
+                      Icon(Icons.Rounded.Pause, contentDescription = null, modifier = Modifier.size(16.dp))
+                      Spacer(Modifier.width(4.dp))
+                      Text("Pause", style = MaterialTheme.typography.labelLarge)
+                    }
+                    OutlinedButton(
+                      onClick = onCancelPdkDownload,
+                      modifier = Modifier.heightIn(min = 48.dp).testTag("pdk_cancel_button"),
+                    ) {
+                      Icon(Icons.Rounded.Cancel, contentDescription = null, modifier = Modifier.size(16.dp))
+                      Spacer(Modifier.width(4.dp))
+                      Text("Cancel", style = MaterialTheme.typography.labelLarge, color = eda.error)
+                    }
+                  } else {
+                    Button(
+                      onClick = { onStartPdkDownload(pdkUrl, expectedSha.ifBlank { null }) },
+                      modifier = Modifier.heightIn(min = 48.dp).testTag("pdk_download_button"),
+                    ) {
+                      Icon(Icons.Rounded.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                      Spacer(Modifier.width(6.dp))
+                      Text(if (dl?.isPaused == true) "Resume Download" else "Fetch & Verify PDK", style = MaterialTheme.typography.labelLarge)
+                    }
+                  }
+                  OutlinedButton(
+                    onClick = { importPdkLauncher.launch(arrayOf("*/*")) },
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("pdk_import_local_button"),
+                  ) {
+                    Icon(Icons.Rounded.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Import .lef / .lib", style = MaterialTheme.typography.labelLarge)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 1b-3. Optional Remote OpenROAD / OpenLane Worker Card
+    if (localBridgeEnabled) {
+      item {
+        Surface(
+          color = eda.elevatedCard,
+          shape = MaterialTheme.shapes.small,
+          border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)),
+          modifier = Modifier.fillMaxWidth().testTag("remote_worker_card"),
+        ) {
+          Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+          ) {
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.SpaceBetween,
+              verticalAlignment = Alignment.CenterVertically,
+            ) {
+              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Icon(Icons.Rounded.Hub, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+                Text("Remote OpenROAD / OpenLane Worker", style = MaterialTheme.typography.labelLarge)
+              }
+              Text(
+                text = localBridgeEndpoint,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+            }
+            if (!state.remoteWorkerStatus.isNullOrBlank()) {
+              Text(
+                text = state.remoteWorkerStatus,
+                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                color = eda.cyanHighlight,
+              )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              OutlinedButton(
+                onClick = onTestRemoteWorker,
+                enabled = !state.isTestingRemoteWorker,
+                modifier = Modifier.heightIn(min = 48.dp).testTag("remote_worker_ping_button"),
+              ) {
+                Text("Ping Health", style = MaterialTheme.typography.labelLarge)
+              }
+              Button(
+                onClick = onRunRemoteWorker,
+                enabled = !state.isTestingRemoteWorker && !state.isSynthesizing,
+                modifier = Modifier.heightIn(min = 48.dp).testTag("remote_worker_run_button"),
+              ) {
+                Text("Run Remote Signoff", style = MaterialTheme.typography.labelLarge)
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // =========================================================================
+    // SECTION 3: RESULTS & DIAGNOSTICS
+    // =========================================================================
+    item {
+      EdaSectionHeader(
+        title = "3. Results & Diagnostics",
+        subtitle = "Synthesis status summary, KLayout GDSII snapshot, warnings & logs",
+      )
+    }
+
+    if (report != null) {
+      item {
+        val timingMet = report.wnsNs >= 0.0
+        EdaSurfaceCard(modifier = Modifier.fillMaxWidth().testTag("synth_results_summary_card")) {
+          Column {
+            EdaPanelHeader(
+              title = "Synthesis Result · ${report.moduleName}",
+              subtitle = "${report.targetLibrary.shortName} · ${report.engineProfile.shortName} · ${report.synthesisDurationMs} ms",
+              icon = Icons.Rounded.CheckCircle,
+              trailing = {
+                EdaStatusPill(
+                  text = if (timingMet) "MET" else "VIOL",
+                  color = if (timingMet) eda.success else eda.error,
+                  containerColor = if (timingMet) eda.successContainer else eda.errorContainer,
+                )
+              },
+            )
+            Column(
+              modifier = Modifier.padding(12.dp),
+              verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+              Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                EdaCompactMetric("Cells", report.cellCount.toString(), modifier = Modifier.weight(1f))
+                EdaCompactMetric(
+                  label = "WNS",
+                  value = "${if (report.wnsNs >= 0) "+" else ""}${"%.2f".format(Locale.US, report.wnsNs)} ns",
+                  valueColor = if (timingMet) eda.success else eda.error,
+                  modifier = Modifier.weight(1f),
+                )
+                EdaCompactMetric(
+                  label = "Fmax",
+                  value = "${"%.1f".format(Locale.US, report.fmaxMhz)} MHz",
+                  valueColor = MaterialTheme.colorScheme.primary,
+                  modifier = Modifier.weight(1f),
+                )
+              }
+              if (!timingMet) {
+                val remediationPlan = remember(report, activeLayout) {
+                  val staSummary = StaticTimingAnalyzer.analyze(report, activeLayout)
+                  StaticTimingAnalyzer.buildViolationRemediation(report, staSummary)
+                }
+                if (remediationPlan != null) {
+                  TimingViolationCalloutStrip(
+                    plan = remediationPlan,
+                    onApplyClockPeriod = onClockPeriodChange,
+                    onApplyOptimizationGoal = onSelectGoal,
+                    onOpenTimingGuide = onOpenAnalysis,
+                  )
+                }
+              }
+              val lec = state.lecReport
+              if (lec != null) {
+                val (lecColor, lecBg) = when (lec.overallStatus) {
+                  LecOverallStatus.EQUIVALENT -> eda.success to eda.successContainer
+                  LecOverallStatus.NON_EQUIVALENT -> eda.error to eda.errorContainer
+                  LecOverallStatus.INCONCLUSIVE -> eda.warning to eda.warningContainer
+                  LecOverallStatus.UNAVAILABLE -> MaterialTheme.colorScheme.onSurfaceVariant to eda.elevatedCard
+                }
+                Surface(
+                  color = eda.elevatedCard,
+                  shape = MaterialTheme.shapes.small,
+                  border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = 0.55f)),
+                  modifier = Modifier.fillMaxWidth().testTag("synth_lec_summary_strip"),
+                ) {
+                  Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                    Row(
+                      modifier = Modifier.weight(1f).padding(end = 8.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                      Icon(Icons.AutoMirrored.Rounded.FactCheck, contentDescription = null, tint = lecColor, modifier = Modifier.size(16.dp))
+                      Column {
+                        Text("Formal Equivalence (LEC)", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                          text = "${lec.matchedCount}/${lec.totalComparePoints} mapped · ${lec.provenCount + lec.boundedEquivalentCount} equiv · ${lec.nonEquivalentCount} fail",
+                          style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                        )
+                      }
+                    }
+                    EdaStatusPill(
+                      text = lec.overallStatus.badge,
+                      color = lecColor,
+                      containerColor = lecBg,
+                      showDot = true,
+                    )
+                  }
+                }
+              }
+              Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
+                OutlinedButton(
+                  onClick = onOpenSchematic,
+                  modifier = Modifier.heightIn(min = 48.dp).testTag("synth_open_schematic_button"),
+                ) {
+                  Icon(Icons.Rounded.AccountTree, contentDescription = null, modifier = Modifier.size(16.dp))
+                  Spacer(Modifier.width(6.dp))
+                  Text("View Schematic", style = MaterialTheme.typography.labelMedium)
+                }
+                OutlinedButton(
+                  onClick = onOpenAnalysis,
+                  modifier = Modifier.heightIn(min = 48.dp).testTag("synth_open_analysis_button"),
+                ) {
+                  Icon(Icons.Rounded.Analytics, contentDescription = null, modifier = Modifier.size(16.dp))
+                  Spacer(Modifier.width(6.dp))
+                  Text("STA / Area / Power", style = MaterialTheme.typography.labelMedium)
+                }
+                OutlinedButton(
+                  onClick = onOpenFormalLec,
+                  modifier = Modifier.heightIn(min = 48.dp).testTag("synth_open_lec_button"),
+                ) {
+                  Icon(Icons.AutoMirrored.Rounded.FactCheck, contentDescription = null, modifier = Modifier.size(16.dp))
+                  Spacer(Modifier.width(6.dp))
+                  Text("Formal LEC", style = MaterialTheme.typography.labelMedium)
                 }
               }
             }
@@ -665,7 +1086,7 @@ fun SynthesisScreen(
             modifier = Modifier.testTag("utilization_slider"),
           )
 
-          Text("Optimization Goal", style = MaterialTheme.typography.labelLarge)
+          Text("Optimization Goal & Gate Mapping", style = MaterialTheme.typography.labelLarge)
           Row(
             modifier = Modifier.horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -678,53 +1099,244 @@ fun SynthesisScreen(
                 modifier = Modifier.testTag("goal_chip_${g.id}"),
               )
             }
+            FilterChip(
+              selected = bitBlastGates,
+              onClick = onToggleBitBlastGates,
+              label = {
+                Text(
+                  if (bitBlastGates) "Bit-Blasted 1-Bit Gates ✓" else "Macro Cell View",
+                  style = MaterialTheme.typography.labelMedium,
+                )
+              },
+              modifier = Modifier.testTag("bit_blast_chip"),
+            )
           }
+        }
+      }
+    }
 
+    // 3a-bis. Visual & Raw SDC Timing Constraints Card
+    item {
+      val sdcSummary = remember(state.sdcText, state.clockPeriodNs) {
+        SdcParser.parse(state.sdcText, state.clockPeriodNs).summaryLine()
+      }
+      EdaSurfaceCard(modifier = Modifier.fillMaxWidth().testTag("sdc_constraints_card")) {
+        Column(
+          modifier = Modifier.padding(14.dp),
+          verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
           Surface(
             onClick = { showAdvancedSdc = !showAdvancedSdc },
             color = eda.elevatedCard,
             shape = MaterialTheme.shapes.small,
             border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = 0.6f)),
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().testTag("advanced_sdc_toggle"),
           ) {
             Row(
               modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
               horizontalArrangement = Arrangement.SpaceBetween,
               verticalAlignment = Alignment.CenterVertically,
             ) {
-              Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+              Row(
+                modifier = Modifier.weight(1f).padding(end = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
                 Icon(Icons.Rounded.Tune, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
-                Text("Advanced SDC Timing Constraints", style = MaterialTheme.typography.labelLarge)
+                Column {
+                  Text("Advanced SDC Timing Constraints", style = MaterialTheme.typography.labelLarge)
+                  Text(
+                    text = sdcSummary,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                  )
+                }
               }
               Icon(
                 imageVector = if (showAdvancedSdc) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
-                contentDescription = null,
+                contentDescription = if (showAdvancedSdc) "Collapse SDC Editor" else "Expand SDC Editor",
               )
             }
           }
 
           if (showAdvancedSdc) {
-            var localSdc by remember(state.sdcText) { mutableStateOf(state.sdcText) }
-            OutlinedTextField(
-              value = localSdc,
-              onValueChange = { localSdc = it },
-              label = { Text("SDC Constraints") },
-              textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMonoFamily),
-              minLines = 4,
-              maxLines = 8,
-              modifier = Modifier.fillMaxWidth().testTag("sdc_constraints_editor"),
+            VisualSdcEditorCard(
+              sdcText = state.sdcText,
+              clockPeriodNs = state.clockPeriodNs,
+              ports = state.parsedDesign?.topModule?.ports.orEmpty(),
+              targetLibrary = state.targetLibrary,
+              moduleName = state.parsedDesign?.topModule?.name ?: state.designName,
+              onUpdateSdc = onUpdateSdc,
+              onResetSdc = onResetSdc,
             )
-            Row(
-              modifier = Modifier.fillMaxWidth(),
-              horizontalArrangement = Arrangement.End,
-            ) {
-              TextButton(onClick = onResetSdc) { Text("Reset Default") }
-              Spacer(Modifier.width(8.dp))
-              Button(
-                onClick = { onUpdateSdc(localSdc) },
-                modifier = Modifier.testTag("apply_sdc_button"),
+          }
+        }
+      }
+    }
+
+    // 3b. Design-for-Testability (DFT) & Scan Chain Configuration
+    item {
+      val dft = state.dftConfig
+      val dftRep = report?.dftReport
+      EdaSurfaceCard(modifier = Modifier.fillMaxWidth().testTag("dft_config_card")) {
+        Column(
+          modifier = Modifier.padding(16.dp),
+          verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            EdaSectionHeader(
+              title = "DFT & Scan Insertion",
+              subtitle = "Scan chains, lockup latches, JTAG TAP & ATPG",
+              modifier = Modifier.weight(1f).padding(end = 8.dp),
+            )
+            EdaStatusPill(
+              text = if (dft.scanInsertionEnabled) "SCAN ON" else "AUDIT ONLY",
+              color = if (dft.scanInsertionEnabled) eda.success else eda.cyanHighlight,
+              containerColor = if (dft.scanInsertionEnabled) eda.successContainer else eda.cyanContainer,
+            )
+          }
+
+          Row(
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Column(modifier = Modifier.weight(1f).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+              Text("Insert Scan Chains (SDFF)", style = MaterialTheme.typography.labelLarge)
+              Text(
+                text = if (dft.scanInsertionEnabled) {
+                  "Converts sequential FFs to ${dft.scanStyle.shortName} scan cells with scan_en/scan_in/scan_out"
+                } else {
+                  "Runs passive DFT DRC & stuck-at fault audit without modifying mapped FFs"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+            }
+            Switch(
+              checked = dft.scanInsertionEnabled,
+              onCheckedChange = { onToggleDftScan() },
+              modifier = Modifier.testTag("dft_scan_enable_switch"),
+            )
+          }
+
+          if (dft.scanInsertionEnabled) {
+            HorizontalDivider(color = eda.subtleBorder.copy(alpha = 0.45f))
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+              Text(
+                text = "Scan Architecture Style",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
               ) {
-                Text("Apply SDC")
+                DftScanStyle.entries.forEach { style ->
+                  FilterChip(
+                    selected = dft.scanStyle == style,
+                    onClick = { onUpdateDftConfig { it.copy(scanStyle = style) } },
+                    label = { Text(style.displayName, style = MaterialTheme.typography.labelMedium) },
+                    modifier = Modifier.testTag("dft_style_${style.id}"),
+                  )
+                }
+              }
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+              Text(
+                text = "Target Scan Chains",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
+                listOf(1, 2, 4).forEach { count ->
+                  FilterChip(
+                    selected = dft.targetChainCount == count,
+                    onClick = { onUpdateDftConfig { it.copy(targetChainCount = count) } },
+                    label = {
+                      Text(
+                        text = if (count == 1) "1 Chain" else "$count Chains",
+                        style = MaterialTheme.typography.labelMedium,
+                      )
+                    },
+                    modifier = Modifier.testTag("dft_chains_$count"),
+                  )
+                }
+              }
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+              Text(
+                text = "Signoff Test Structures",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+              )
+              Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
+                FilterChip(
+                  selected = dft.insertLockupLatches,
+                  onClick = { onUpdateDftConfig { it.copy(insertLockupLatches = !it.insertLockupLatches) } },
+                  label = { Text("Lockup Latches", style = MaterialTheme.typography.labelMedium) },
+                  modifier = Modifier.testTag("dft_lockup_chip"),
+                )
+                FilterChip(
+                  selected = dft.insertJtagBoundaryTap,
+                  onClick = { onUpdateDftConfig { it.copy(insertJtagBoundaryTap = !it.insertJtagBoundaryTap) } },
+                  label = { Text("IEEE 1149.1 JTAG TAP", style = MaterialTheme.typography.labelMedium) },
+                  modifier = Modifier.testTag("dft_jtag_chip"),
+                )
+                FilterChip(
+                  selected = dft.insertMbistCollar,
+                  onClick = { onUpdateDftConfig { it.copy(insertMbistCollar = !it.insertMbistCollar) } },
+                  label = { Text("MBIST Collar", style = MaterialTheme.typography.labelMedium) },
+                  modifier = Modifier.testTag("dft_mbist_chip"),
+                )
+              }
+            }
+          }
+
+          if (dftRep != null) {
+            Surface(
+              color = eda.codeSurface.copy(alpha = 0.7f),
+              shape = MaterialTheme.shapes.medium,
+              modifier = Modifier.fillMaxWidth(),
+            ) {
+              Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+              ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                  Text(
+                    text = "Stuck-At Cov: ${"%.1f".format(Locale.US, dftRep.stuckAtCoveragePct)}% · ${dftRep.detectedFaults}/${dftRep.totalFaults} faults",
+                    style = MaterialTheme.typography.labelMedium.copy(fontFamily = JetBrainsMonoFamily),
+                    color = eda.cyanHighlight,
+                  )
+                  Text(
+                    text = "${dftRep.scanChains.size} scan chain(s) · ${dftRep.atpgVectors.size} ATPG vectors",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+                }
+                TextButton(
+                  onClick = onOpenReports,
+                  modifier = Modifier.heightIn(min = 48.dp).testTag("dft_view_report_button"),
+                ) {
+                  Text("View DFT")
+                }
               }
             }
           }
@@ -736,6 +1348,7 @@ fun SynthesisScreen(
     if (synthError != null) {
       item {
         Surface(
+          onClick = onJumpToEditor,
           color = eda.errorContainer,
           shape = MaterialTheme.shapes.medium,
           border = BorderStroke(1.dp, eda.error.copy(alpha = 0.7f)),
@@ -754,7 +1367,7 @@ fun SynthesisScreen(
               )
             }
             Text(synthError.message, style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = onJumpToEditor) {
+            TextButton(onClick = onJumpToEditor, modifier = Modifier.testTag("jump_to_error_line_button")) {
               Icon(Icons.Rounded.Code, contentDescription = null, modifier = Modifier.size(16.dp))
               Spacer(Modifier.width(4.dp))
               Text("Open Editor at Line ${synthError.line}")

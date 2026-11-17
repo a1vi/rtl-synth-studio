@@ -15,18 +15,33 @@ import com.example.data.model.SynthesisRun
 import com.example.data.model.TargetLibrary
 import android.content.Context
 import com.example.domain.synth.DeviceResourceSnapshot
+import com.example.domain.synth.DftConfig
+import com.example.domain.synth.DftEngine
+import com.example.domain.synth.DftScanStyle
 import com.example.domain.synth.FlowStageId
 import com.example.domain.synth.FlowStageState
 import com.example.domain.synth.FlowStageStatus
+import com.example.domain.synth.FormalEquivalenceEngine
+import com.example.domain.synth.FormalEquivalenceReport
 import com.example.domain.synth.GateNode
 import com.example.domain.synth.GateType
+import com.example.domain.synth.LecConfig
+import com.example.domain.synth.ScanInsertionOutcome
 import com.example.domain.synth.NetlistLayoutEngine
 import com.example.domain.synth.ParsedVerilogDesign
 import com.example.domain.synth.PdkCatalogManager
+import com.example.domain.synth.PdkDownloadProgress
 import com.example.domain.synth.PdkPackageStatus
 import com.example.domain.synth.PhysicalLayoutSnapshot
 import com.example.domain.synth.PortDirection
+import com.example.domain.synth.PowerAnalysisEngine
+import com.example.domain.synth.PowerAnalysisReport
+import com.example.domain.synth.PowerEstimationConfig
 import com.example.domain.synth.PresetRtlDesigns
+import com.example.domain.synth.RemoteWorkstationClient
+import com.example.domain.synth.RtlDesignRuleChecker
+import com.example.domain.synth.RtlDrcReport
+import com.example.domain.synth.RtlDrcScanOutcome
 import com.example.domain.synth.RtlPort
 import com.example.domain.synth.RtlPresetTemplate
 import com.example.domain.synth.RtlSimulator
@@ -37,7 +52,10 @@ import com.example.domain.synth.SimulationResult
 import com.example.domain.synth.StimulusPattern
 import com.example.domain.synth.SynthesisReport
 import com.example.domain.synth.SynthesisResult
+import com.example.domain.synth.TimingPathDetail
 import com.example.domain.synth.VerilogParseResult
+import com.example.service.RtlFlowForegroundService
+import java.io.InputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
@@ -118,6 +136,23 @@ data class WorkbenchUiState(
   val stimulusPatterns: Map<String, StimulusPattern> = emptyMap(),
   val customSimValues: Map<Pair<String, Int>, Long> = emptyMap(),
   val selectedWaveformSignals: Set<String> = emptySet(),
+  val pendingEditorJump: Pair<String?, Int>? = null,
+  val resolvedIncludes: List<String> = emptyList(),
+  val pdkDownloadProgress: PdkDownloadProgress? = null,
+  val remoteWorkerStatus: String? = null,
+  val isTestingRemoteWorker: Boolean = false,
+  val dftConfig: DftConfig = DftConfig(),
+  val powerAnalysis: PowerAnalysisReport? = null,
+  val powerConfig: PowerEstimationConfig = PowerEstimationConfig(),
+  val rtlDrcReport: RtlDrcReport? = null,
+  val isResultOutdated: Boolean = false,
+  val synthesisRunSequence: Int = 0,
+  val highlightedPathNodeIds: Set<String> = emptySet(),
+  val highlightedPathNets: Set<String> = emptySet(),
+  val activeTimingPathId: String? = null,
+  val lecReport: FormalEquivalenceReport? = null,
+  val lecConfig: LecConfig = LecConfig(),
+  val isRunningLec: Boolean = false,
 ) {
   val activeFile: RtlFileEntry?
     get() = files.firstOrNull { it.id == activeFileId } ?: files.firstOrNull()
@@ -171,6 +206,10 @@ class RtlSynthViewModel(
   private var dirtyForAutoSave: Boolean = false
   private var lastAutoSavedSignature: ProjectSaveSignature? = null
   private var activeFlowJob: Job? = null
+  private var appContext: Context? = null
+  private var pdkDownloadJob: Job? = null
+  @Volatile private var pdkPausedFlag = false
+  @Volatile private var pdkCanceledFlag = false
 
   private val _workbench = MutableStateFlow(createInitialState())
   val workbench: StateFlow<WorkbenchUiState> = _workbench.asStateFlow()
@@ -178,6 +217,16 @@ class RtlSynthViewModel(
   init {
     refreshLiveParse()
     startLocalAutoSaveLoops()
+  }
+
+  fun attachAppContext(context: Context) {
+    if (appContext != null) return
+    appContext = context.applicationContext
+    viewModelScope.launch {
+      RtlFlowForegroundService.cancelRequests.collect {
+        cancelRtlToGdsFlow()
+      }
+    }
   }
 
   private fun createInitialState(): WorkbenchUiState {
@@ -214,6 +263,7 @@ class RtlSynthViewModel(
         coreUtilizationPercent = draft.coreUtilizationPercent.coerceIn(30, 85),
         autoSaveStatus = AutoSaveStatus.SAVED,
         lastAutoSavedLabel = restoredLabel,
+        dftConfig = draft.dftConfig,
       )
     } else {
       val first = PresetRtlDesigns.templates.first()
@@ -261,6 +311,7 @@ class RtlSynthViewModel(
         files = state.files,
         activeFileId = state.activeFileId,
         coreUtilizationPercent = state.coreUtilizationPercent,
+        dftConfig = state.dftConfig,
       )
     )
   }
@@ -353,6 +404,7 @@ class RtlSynthViewModel(
         files = state.files,
         activeFileId = state.activeFileId,
         coreUtilizationPercent = state.coreUtilizationPercent,
+        dftConfig = state.dftConfig,
       )
     )
 
@@ -406,8 +458,8 @@ class RtlSynthViewModel(
   }
 
   private fun applyParseToState(state: WorkbenchUiState): WorkbenchUiState {
-    val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(state.files, state.verilogCode)
-    return when (val parsed = RtlProjectHelpers.parseLanguageAware(combinedRtl, state.selectedTopModule)) {
+    val bundle = RtlProjectHelpers.bundleProjectSources(state.files, state.verilogCode)
+    return when (val parsed = RtlProjectHelpers.parseLanguageAware(bundle.combinedSource, state.selectedTopModule)) {
       is VerilogParseResult.Success -> {
         val validTop = state.selectedTopModule?.takeIf { sel ->
           parsed.design.modules.any { it.name == sel }
@@ -419,22 +471,86 @@ class RtlSynthViewModel(
             clockPeriodNs = state.clockPeriodNs,
           )
         }
+        val drc = RtlDesignRuleChecker.checkDesign(parsed.design, bundle.combinedSource)
         state.copy(
           selectedTopModule = validTop,
           parsedDesign = parsed.design,
           parseError = null,
           sdcText = nextSdc,
+          resolvedIncludes = bundle.resolvedIncludes,
+          rtlDrcReport = drc,
         )
       }
       is VerilogParseResult.Error -> state.copy(
         parsedDesign = null,
         parseError = parsed,
+        resolvedIncludes = bundle.resolvedIncludes,
+        rtlDrcReport = null,
       )
     }
   }
 
   private fun refreshLiveParse() {
     _workbench.update { applyParseToState(it) }
+  }
+
+  fun runRtlDrcScan() {
+    val snapshot = _workbench.value
+    val bundle = RtlProjectHelpers.bundleProjectSources(snapshot.files, snapshot.verilogCode)
+    when (val outcome = RtlDesignRuleChecker.checkSource(bundle.combinedSource, snapshot.selectedTopModule)) {
+      is RtlDrcScanOutcome.ParseFailed -> {
+        _workbench.update {
+          it.copy(
+            parseError = outcome.error,
+            parsedDesign = null,
+            rtlDrcReport = null,
+            statusBanner = "RTL DRC blocked by syntax error at line ${outcome.error.line}: ${outcome.error.message}",
+          )
+        }
+      }
+      is RtlDrcScanOutcome.Ready -> {
+        val rep = outcome.report
+        val msg = if (rep.isClean) {
+          "RTL DRC Clean: ${rep.rulesEvaluated} rules checked across ${rep.modulesScanned} module(s) (${rep.scanDurationMs} ms)."
+        } else {
+          "RTL DRC: ${rep.errorCount} error(s), ${rep.warningCount} warning(s) found — tap any issue to inspect line."
+        }
+        _workbench.update {
+          it.copy(
+            rtlDrcReport = rep,
+            statusBanner = msg,
+          )
+        }
+      }
+    }
+  }
+
+  fun jumpToEditorLine(line: Int, fileId: String? = null) {
+    val safeLine = line.coerceAtLeast(1)
+    _workbench.update { state ->
+      val targetId = fileId?.takeIf { id -> state.files.any { it.id == id } } ?: state.activeFileId
+      val nextTabs = if (targetId in state.openTabIds) state.openTabIds else state.openTabIds + targetId
+      state.copy(
+        activeFileId = targetId,
+        openTabIds = nextTabs,
+        pendingEditorJump = targetId to safeLine,
+      )
+    }
+  }
+
+  fun jumpToCombinedLine(combinedLine: Int) {
+    val state = _workbench.value
+    val bundle = RtlProjectHelpers.bundleProjectSources(state.files, state.verilogCode)
+    val mapped = RtlProjectHelpers.mapCombinedLineToFile(bundle, combinedLine)
+    if (mapped != null) {
+      jumpToEditorLine(line = mapped.second, fileId = mapped.first)
+    } else {
+      jumpToEditorLine(line = combinedLine)
+    }
+  }
+
+  fun consumePendingEditorJump() {
+    _workbench.update { it.copy(pendingEditorJump = null) }
   }
 
   // ==================== MULTI-FILE & EDITOR ACTIONS ====================
@@ -457,6 +573,7 @@ class RtlSynthViewModel(
             sdcText = content,
             clockPeriodNs = nextPeriod,
             hasUnsavedChanges = true,
+            isResultOutdated = it.synthesisResult != null,
           ).also(::persistDraft)
         }
       }
@@ -485,6 +602,7 @@ class RtlSynthViewModel(
               verilogCode = primaryCode,
               primaryLanguage = detectedLang,
               hasUnsavedChanges = true,
+              isResultOutdated = state.synthesisResult != null,
             )
           ).also(::persistDraft)
         }
@@ -516,6 +634,7 @@ class RtlSynthViewModel(
           files = updatedFiles,
           primaryLanguage = lang,
           hasUnsavedChanges = true,
+          isResultOutdated = state.synthesisResult != null,
         )
       ).also(::persistDraft)
     }
@@ -625,6 +744,7 @@ class RtlSynthViewModel(
   }
 
   fun refreshDeviceAndPdkTelemetry(context: Context) {
+    attachAppContext(context)
     val targetLib = _workbench.value.targetLibrary
     viewModelScope.launch(Dispatchers.IO) {
       val pdk = runCatching { PdkCatalogManager.ensureAndVerifyPdk(context, targetLib) }.getOrNull()
@@ -633,6 +753,251 @@ class RtlSynthViewModel(
         it.copy(
           pdkPackageStatus = pdk ?: it.pdkPackageStatus,
           deviceResources = res ?: it.deviceResources,
+        )
+      }
+    }
+  }
+
+  fun startPdkDownload(context: Context, urlString: String, expectedSha256: String? = null) {
+    attachAppContext(context)
+    pdkDownloadJob?.cancel()
+    pdkPausedFlag = false
+    pdkCanceledFlag = false
+    val lib = _workbench.value.targetLibrary
+    pdkDownloadJob = viewModelScope.launch {
+      _workbench.update {
+        it.copy(
+          pdkDownloadProgress = PdkDownloadProgress(
+            library = lib,
+            isDownloading = true,
+            statusMessage = "Connecting to PDK mirror...",
+          )
+        )
+      }
+      RtlFlowForegroundService.startOrUpdate(context, "Downloading ${lib.shortName} PDK", "Streaming standard-cell files...", 1, 100)
+      val result = PdkCatalogManager.downloadWithResume(
+        context = context,
+        library = lib,
+        urlString = urlString,
+        expectedSha256 = expectedSha256,
+        isPaused = { pdkPausedFlag },
+        isCanceled = { pdkCanceledFlag },
+        onProgress = { dl, total ->
+          val pct = if (total > 0L) ((dl * 100) / total).toInt().coerceIn(1, 100) else 25
+          _workbench.update { state ->
+            state.copy(
+              pdkDownloadProgress = PdkDownloadProgress(
+                library = lib,
+                isDownloading = true,
+                downloadedBytes = dl,
+                totalBytes = total,
+                statusMessage = if (total > 0L) "${dl / 1024} / ${total / 1024} KB ($pct%)" else "${dl / 1024} KB received",
+              )
+            )
+          }
+        },
+      )
+      RtlFlowForegroundService.stop(context)
+      result.onSuccess { status ->
+        _workbench.update { state ->
+          state.copy(
+            pdkPackageStatus = status,
+            pdkDownloadProgress = PdkDownloadProgress(
+              library = lib,
+              isDownloading = false,
+              downloadedBytes = (status.sizeKb * 1024).toLong(),
+              totalBytes = (status.sizeKb * 1024).toLong(),
+              statusMessage = "SHA-256 verified (${status.sha256Short})",
+              sha256Full = status.sha256Short,
+            ),
+            statusBanner = "Downloaded & verified ${lib.shortName} (${status.downloadedFileName}).",
+          )
+        }
+      }.onFailure { err ->
+        _workbench.update { state ->
+          state.copy(
+            pdkDownloadProgress = PdkDownloadProgress(
+              library = lib,
+              isDownloading = false,
+              isPaused = pdkPausedFlag,
+              statusMessage = err.localizedMessage ?: "Download interrupted",
+              error = if (pdkPausedFlag || pdkCanceledFlag) null else (err.localizedMessage ?: "Download error"),
+            ),
+            statusBanner = err.localizedMessage ?: "PDK download failed.",
+          )
+        }
+      }
+    }
+  }
+
+  fun pausePdkDownload() {
+    pdkPausedFlag = true
+    _workbench.update { state ->
+      state.copy(
+        pdkDownloadProgress = state.pdkDownloadProgress?.copy(
+          isDownloading = false,
+          isPaused = true,
+          statusMessage = "Paused — tap Resume to continue HTTP Range download",
+        )
+      )
+    }
+  }
+
+  fun cancelPdkDownload() {
+    pdkCanceledFlag = true
+    pdkDownloadJob?.cancel()
+    _workbench.update { state ->
+      state.copy(
+        pdkDownloadProgress = null,
+        statusBanner = "Canceled PDK package download.",
+      )
+    }
+  }
+
+  fun importLocalPdkFile(context: Context, fileName: String, inputStream: InputStream) {
+    viewModelScope.launch(Dispatchers.IO) {
+      val lib = _workbench.value.targetLibrary
+      PdkCatalogManager.importLocalPdkStream(context, lib, fileName, inputStream)
+        .onSuccess { status ->
+          _workbench.update {
+            it.copy(
+              pdkPackageStatus = status,
+              statusBanner = "Imported $fileName into ${lib.shortName} (${status.customCellCount} cells/macros, SHA-256 ${status.sha256Short}).",
+            )
+          }
+        }
+        .onFailure { err ->
+          _workbench.update { it.copy(statusBanner = "PDK import failed: ${err.localizedMessage ?: "error"}") }
+        }
+    }
+  }
+
+  fun toggleBitBlastGates() {
+    updateSettings { it.copy(bitBlastGates = !it.bitBlastGates) }
+    val enabled = _settings.value.bitBlastGates
+    _workbench.update {
+      it.copy(statusBanner = if (enabled) "Bit-Blasted 1-bit gate decomposition enabled." else "Macro arithmetic cell view enabled.")
+    }
+    if (_workbench.value.synthesisResult != null) {
+      runSynthesis()
+    }
+  }
+
+  fun updateDftConfig(
+    rerunSynthesisIfAvailable: Boolean = false,
+    transform: (DftConfig) -> DftConfig,
+  ) {
+    _workbench.update { state ->
+      val next = transform(state.dftConfig)
+      state.copy(
+        dftConfig = next,
+        hasUnsavedChanges = true,
+        isResultOutdated = !rerunSynthesisIfAvailable && state.synthesisResult != null,
+      ).also(::persistDraft)
+    }
+    if (rerunSynthesisIfAvailable && _workbench.value.synthesisResult != null) {
+      runSynthesis()
+    }
+  }
+
+  fun toggleDftScanInsertion() {
+    val nextEnabled = !_workbench.value.dftConfig.scanInsertionEnabled
+    updateDftConfig(rerunSynthesisIfAvailable = _workbench.value.synthesisResult != null) { cfg ->
+      cfg.copy(scanInsertionEnabled = nextEnabled)
+    }
+    _workbench.update {
+      it.copy(
+        statusBanner = if (nextEnabled) {
+          "DFT Scan Chain Insertion enabled (${it.dftConfig.scanStyle.displayName})."
+        } else {
+          "DFT Scan Insertion disabled (functional netlist mode)."
+        },
+      )
+    }
+  }
+
+  fun regenerateAtpgPatterns(maxPatterns: Int = _workbench.value.dftConfig.atpgMaxPatterns) {
+    val safeMax = maxPatterns.coerceIn(8, 128)
+    _workbench.update { state ->
+      val nextCfg = state.dftConfig.copy(atpgMaxPatterns = safeMax)
+      val currentSuccess = state.synthesisResult as? SynthesisResult.Success
+      if (currentSuccess == null) {
+        state.copy(dftConfig = nextCfg).also(::persistDraft)
+      } else {
+        val rep = currentSuccess.report
+        val prevDft = rep.dftReport
+        val updatedDft = DftEngine.analyzeAndGenerateAtpg(
+          moduleName = rep.moduleName,
+          ports = rep.ports,
+          nodes = rep.nodes,
+          edges = rep.edges,
+          library = rep.targetLibrary,
+          clockPeriodNs = rep.clockPeriodNs,
+          totalAreaUm2 = rep.totalAreaUm2,
+          config = nextCfg,
+          scanInsertion = ScanInsertionOutcome(
+            ports = rep.ports,
+            nodes = rep.nodes,
+            scanChains = prevDft?.scanChains.orEmpty(),
+            lockupLatchCount = prevDft?.lockupLatchCount ?: 0,
+            jtagTapInserted = prevDft?.jtagTapInserted ?: false,
+            mbistCollarInserted = prevDft?.mbistCollarInserted ?: false,
+            scanAreaOverheadUm2 = prevDft?.scanAreaOverheadUm2 ?: 0.0,
+            scanInsertedCount = prevDft?.scanReplacedElements ?: 0,
+          ),
+        )
+        state.copy(
+          dftConfig = nextCfg,
+          synthesisResult = SynthesisResult.Success(rep.copy(dftReport = updatedDft)),
+          statusBanner = "ATPG re-graded: ${"%.1f".format(Locale.US, updatedDft.stuckAtCoveragePct)}% Stuck-At coverage (${updatedDft.atpgVectors.size} vectors).",
+        ).also(::persistDraft)
+      }
+    }
+  }
+
+  fun testRemoteWorkstationConnection() {
+    val endpoint = _settings.value.localBridgeEndpoint
+    viewModelScope.launch {
+      _workbench.update { it.copy(isTestingRemoteWorker = true, remoteWorkerStatus = "Pinging $endpoint/health ...") }
+      val health = RemoteWorkstationClient.checkHealth(endpoint)
+      val summary = if (health.ok) {
+        val toolTag = if (health.tools.isNotEmpty()) " [${health.tools.joinToString(", ")}]" else ""
+        "Online: ${health.message}$toolTag"
+      } else {
+        health.message
+      }
+      _workbench.update {
+        it.copy(
+          isTestingRemoteWorker = false,
+          remoteWorkerStatus = summary,
+          statusBanner = summary,
+        )
+      }
+    }
+  }
+
+  fun runRemoteWorkstationFlow() {
+    val snapshot = _workbench.value
+    val endpoint = _settings.value.localBridgeEndpoint
+    val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(snapshot.files, snapshot.verilogCode)
+    val modName = snapshot.parsedDesign?.topModule?.name ?: snapshot.designName.ifBlank { "rtl_top" }
+    viewModelScope.launch {
+      _workbench.update { it.copy(isTestingRemoteWorker = true, remoteWorkerStatus = "Submitting $modName to $endpoint ...") }
+      val res = RemoteWorkstationClient.submitRtlFlow(
+        baseUrl = endpoint,
+        moduleName = modName,
+        library = snapshot.targetLibrary,
+        clockPeriodNs = snapshot.clockPeriodNs,
+        utilizationPct = snapshot.coreUtilizationPercent,
+        verilogSource = combinedRtl,
+        sdcText = snapshot.sdcText,
+      )
+      _workbench.update { state ->
+        state.copy(
+          isTestingRemoteWorker = false,
+          remoteWorkerStatus = res.message,
+          flowLogLines = if (res.logs.isNotEmpty()) state.flowLogLines + "[REMOTE] ${res.message}" + res.logs else state.flowLogLines + "[REMOTE] ${res.message}",
+          statusBanner = res.message,
         )
       }
     }
@@ -791,6 +1156,8 @@ class RtlSynthViewModel(
           flowLogLines = emptyList(),
           physicalLayout = null,
           simulationResult = null,
+          powerAnalysis = null,
+          lecReport = null,
           canResumeFlow = false,
           hasUnsavedChanges = true,
           stimulusPatterns = emptyMap(),
@@ -808,6 +1175,121 @@ class RtlSynthViewModel(
     _workbench.update { it.copy(selectedNodeId = nodeId) }
   }
 
+  fun inspectTimingPathInSchematic(path: TimingPathDetail) {
+    val focusId = path.stages.lastOrNull { !it.gateType.isPort }?.nodeId
+      ?: path.stages.lastOrNull()?.nodeId
+    _workbench.update {
+      it.copy(
+        selectedNodeId = focusId ?: it.selectedNodeId,
+        highlightedPathNodeIds = path.nodeIds,
+        highlightedPathNets = path.netNames,
+        activeTimingPathId = path.pathId,
+      )
+    }
+  }
+
+  fun highlightNodesInSchematic(
+    nodeIds: Set<String>,
+    focusNodeId: String? = nodeIds.firstOrNull(),
+    netNames: Set<String> = emptySet(),
+    activePathId: String? = null,
+  ) {
+    _workbench.update {
+      it.copy(
+        selectedNodeId = focusNodeId ?: it.selectedNodeId,
+        highlightedPathNodeIds = nodeIds,
+        highlightedPathNets = netNames,
+        activeTimingPathId = activePathId,
+      )
+    }
+  }
+
+  fun clearSchematicPathHighlight() {
+    _workbench.update {
+      it.copy(
+        highlightedPathNodeIds = emptySet(),
+        highlightedPathNets = emptySet(),
+      )
+    }
+  }
+
+  fun setActiveTimingPathId(pathId: String?) {
+    _workbench.update { it.copy(activeTimingPathId = pathId) }
+  }
+
+  fun updatePowerConfig(transform: (PowerEstimationConfig) -> PowerEstimationConfig) {
+    _workbench.update { current ->
+      val nextCfg = transform(current.powerConfig)
+      val existingReport = (current.synthesisResult as? SynthesisResult.Success)?.report
+      val updatedReport = existingReport?.let { applyPowerActivity(it, current.simulationResult, nextCfg) }
+      current.copy(
+        powerConfig = nextCfg,
+        synthesisResult = if (updatedReport != null) SynthesisResult.Success(updatedReport) else current.synthesisResult,
+        powerAnalysis = updatedReport?.powerAnalysis ?: current.powerAnalysis,
+      )
+    }
+  }
+
+  fun updateLecConfig(transform: (LecConfig) -> LecConfig) {
+    _workbench.update { current ->
+      current.copy(lecConfig = transform(current.lecConfig))
+    }
+  }
+
+  fun runFormalEquivalenceCheck(customNetlistOverride: String? = null) {
+    val snapshot = _workbench.value
+    val activeReport = (snapshot.synthesisResult as? SynthesisResult.Success)?.report
+    val nextCfg = if (customNetlistOverride != null) {
+      snapshot.lecConfig.copy(customRevisedNetlistOverride = customNetlistOverride.takeIf { it.isNotBlank() })
+    } else {
+      snapshot.lecConfig
+    }
+    _workbench.update { it.copy(isRunningLec = true, lecConfig = nextCfg) }
+    viewModelScope.launch {
+      val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(snapshot.files, snapshot.verilogCode)
+      val lecResult = withContext(Dispatchers.Default) {
+        FormalEquivalenceEngine.verify(
+          goldenRtlSource = combinedRtl,
+          report = activeReport,
+          topModuleName = snapshot.selectedTopModule,
+          isNetlistStale = snapshot.isResultOutdated,
+          config = nextCfg,
+        )
+      }
+      _workbench.update { current ->
+        current.copy(
+          lecReport = lecResult,
+          isRunningLec = false,
+          statusBanner = "Formal LEC (${lecResult.overallStatus.badge}): ${lecResult.provenCount + lecResult.boundedEquivalentCount} equiv · ${lecResult.nonEquivalentCount} non-eq · ${lecResult.inconclusiveCount} inconcl",
+        )
+      }
+    }
+  }
+
+  fun saveOrUpdateTestbenchFile(content: String) {
+    val clean = content.trimEnd()
+    _workbench.update { current ->
+      val existingTb = current.files.firstOrNull { it.language == RtlLanguage.TESTBENCH }
+      val nextFiles = if (existingTb != null) {
+        current.files.map { if (it.id == existingTb.id) it.copy(content = clean) else it }
+      } else {
+        val topName = current.selectedTopModule ?: current.designName.ifBlank { "rtl_top" }
+        val newEntry = RtlFileEntry(
+          id = "file_tb_${UUID.randomUUID().toString().take(8)}",
+          name = "${topName}_tb.sv",
+          language = RtlLanguage.TESTBENCH,
+          content = clean,
+        )
+        current.files + newEntry
+      }
+      current.copy(
+        files = nextFiles,
+        hasUnsavedChanges = true,
+        statusBanner = "Testbench saved (${clean.lines().size} lines). Run Testbench Sim to evaluate.",
+      ).also(::persistDraft)
+    }
+  }
+
   fun startBlankSchematic() {
     val state = _workbench.value
     val blankReport = RtlSynthesisEngine.createBlankManualReport(
@@ -819,9 +1301,11 @@ class RtlSynthViewModel(
     _workbench.update {
       it.copy(
         synthesisResult = SynthesisResult.Success(blankReport),
+        powerAnalysis = blankReport.powerAnalysis,
         selectedNodeId = null,
         manualNodePositions = emptyMap(),
         isManualSchematic = true,
+        lecReport = null,
         statusBanner = "Started blank schematic canvas — drag logic gates to build.",
       )
     }
@@ -1038,6 +1522,7 @@ class RtlSynthViewModel(
     _workbench.update {
       it.copy(
         synthesisResult = SynthesisResult.Success(updatedReport),
+        powerAnalysis = updatedReport.powerAnalysis,
         selectedNodeId = selectedNodeId,
         manualNodePositions = positions,
         isManualSchematic = true,
@@ -1292,6 +1777,16 @@ class RtlSynthViewModel(
         )
       }
       val combinedRtl = RtlProjectHelpers.combineProjectRtlSources(snapshot.files, snapshot.verilogCode)
+      val useBitBlast = _settings.value.bitBlastGates
+      appContext?.let { ctx ->
+        RtlFlowForegroundService.startOrUpdate(
+          ctx,
+          "RTL Synth: ${snapshot.designName}",
+          "Stage 1/7: Elaborating RTL",
+          1,
+          FlowStageId.entries.size,
+        )
+      }
       try {
         val (parseResult, flowEvent, simResult) = withContext(Dispatchers.Default) {
           val parsed = RtlProjectHelpers.parseLanguageAware(combinedRtl, snapshot.selectedTopModule)
@@ -1309,9 +1804,22 @@ class RtlSynthViewModel(
             existingReport = existingReport,
             startFromStageIndex = startFromStageIndex,
             stepDelayMs = 0L,
+            bitBlast = useBitBlast,
+            dftConfig = snapshot.dftConfig,
             onProgress = { progressEvent ->
               val passedCount = progressEvent.stageStates.count { it.status == FlowStageStatus.PASSED }
               val runningStage = progressEvent.stageStates.firstOrNull { it.status == FlowStageStatus.RUNNING }
+              appContext?.let { ctx ->
+                runningStage?.let {
+                  RtlFlowForegroundService.startOrUpdate(
+                    ctx,
+                    "RTL Synth: ${snapshot.designName}",
+                    "Stage ${it.id.order}/7: ${it.id.title}",
+                    passedCount.coerceAtLeast(1),
+                    FlowStageId.entries.size,
+                  )
+                }
+              }
               _workbench.update { current ->
                 current.copy(
                   flowStages = progressEvent.stageStates,
@@ -1341,7 +1849,13 @@ class RtlSynthViewModel(
           Triple(parsed, finalEvent, sim)
         }
 
-        val result = flowEvent.synthesisResult ?: snapshot.synthesisResult
+        val rawResult = flowEvent.synthesisResult ?: snapshot.synthesisResult
+        val effectiveSim = simResult ?: snapshot.simulationResult
+        val result = when (rawResult) {
+          is SynthesisResult.Success -> SynthesisResult.Success(applyPowerActivity(rawResult.report, effectiveSim, snapshot.powerConfig))
+          else -> rawResult
+        }
+        val activePower = (result as? SynthesisResult.Success)?.report?.powerAnalysis
         val duration = (result as? SynthesisResult.Success)?.report?.synthesisDurationMs
           ?: flowEvent.stageStates.sumOf { it.durationMs }
         val phaseSummary = when (result) {
@@ -1358,11 +1872,25 @@ class RtlSynthViewModel(
           else -> null
         }
 
+        val postSynthReport = (result as? SynthesisResult.Success)?.report
+        val postSynthLec = postSynthReport?.let { rep ->
+          withContext(Dispatchers.Default) {
+            FormalEquivalenceEngine.verify(
+              goldenRtlSource = combinedRtl,
+              report = rep,
+              topModuleName = snapshot.selectedTopModule,
+              isNetlistStale = false,
+              config = snapshot.lecConfig,
+            )
+          }
+        }
+
         _workbench.update { state ->
           state.copy(
             parsedDesign = (parseResult as? VerilogParseResult.Success)?.design,
             parseError = parseResult as? VerilogParseResult.Error,
             synthesisResult = result,
+            powerAnalysis = activePower ?: state.powerAnalysis,
             flowStages = flowEvent.stageStates,
             flowLogLines = flowEvent.logLines,
             physicalLayout = flowEvent.layoutSnapshot ?: state.physicalLayout,
@@ -1373,8 +1901,14 @@ class RtlSynthViewModel(
             manualNodePositions = emptyMap(),
             isManualSchematic = false,
             isSynthesizing = false,
+            isResultOutdated = false,
+            synthesisRunSequence = state.synthesisRunSequence + 1,
+            highlightedPathNodeIds = emptySet(),
+            highlightedPathNets = emptySet(),
             canResumeFlow = result is SynthesisResult.Error,
             simulationResult = simResult ?: state.simulationResult,
+            rtlDrcReport = (result as? SynthesisResult.Success)?.report?.rtlDrcReport ?: state.rtlDrcReport,
+            lecReport = postSynthLec,
           )
         }
 
@@ -1392,8 +1926,26 @@ class RtlSynthViewModel(
         }
       } catch (_: CancellationException) {
         // Handled cleanly by cancelRtlToGdsFlow() or superseded by a newer run
+      } finally {
+        appContext?.let { RtlFlowForegroundService.stop(it) }
       }
     }
+  }
+
+  private fun applyPowerActivity(
+    report: SynthesisReport,
+    simulation: SimulationResult?,
+    powerConfig: PowerEstimationConfig = _workbench.value.powerConfig,
+  ): SynthesisReport {
+    val pwr = PowerAnalysisEngine.analyze(report, simulation, powerConfig)
+    return report.copy(
+      switchingPowerMw = pwr.switchingPowerMw,
+      internalPowerMw = pwr.internalPowerMw,
+      dynamicPowerMw = pwr.dynamicPowerMw,
+      leakagePowerMw = pwr.leakagePowerMw,
+      totalPowerMw = pwr.totalPowerMw,
+      powerAnalysis = pwr,
+    )
   }
 
   // ==================== RTL SIMULATION ====================
@@ -1437,11 +1989,15 @@ class RtlSynthViewModel(
         }
       }
       if (sim != null) {
-        _workbench.update {
-          it.copy(
+        _workbench.update { current ->
+          val existingReport = (current.synthesisResult as? SynthesisResult.Success)?.report
+          val updatedReport = existingReport?.let { applyPowerActivity(it, sim) }
+          current.copy(
             simulationResult = sim,
-            customSimValues = if (useTestbenchFile) overrides else it.customSimValues,
-            statusBanner = if (useTestbenchFile) "Applied testbench stimulus and simulated ${sim.cycleCount} cycles." else it.statusBanner,
+            synthesisResult = if (updatedReport != null) SynthesisResult.Success(updatedReport) else current.synthesisResult,
+            powerAnalysis = updatedReport?.powerAnalysis ?: current.powerAnalysis,
+            customSimValues = if (useTestbenchFile) overrides else current.customSimValues,
+            statusBanner = if (useTestbenchFile) "Applied testbench stimulus and simulated ${sim.cycleCount} cycles." else current.statusBanner,
           )
         }
       } else {
@@ -1572,6 +2128,20 @@ class RtlSynthViewModel(
     localStore?.recordLocalRun(runPayload)
     _workbench.update {
       it.copy(statusBanner = "Saved engineering report snapshot (${report.targetLibrary.shortName}).")
+    }
+  }
+
+  fun renameSavedDesign(designId: String, newName: String) {
+    val clean = newName.trim().take(80)
+    if (clean.isBlank()) {
+      _workbench.update { it.copy(statusBanner = "Project name cannot be empty.") }
+      return
+    }
+    val existing = localStore?.localDesigns?.value?.firstOrNull { it.id == designId } ?: return
+    localStore.upsertLocalDesign(existing.copy(name = clean))
+    _workbench.update { state ->
+      val updated = if (state.activeDesignId == designId) state.copy(designName = clean) else state
+      updated.copy(statusBanner = "Renamed '${existing.name}' to '$clean'.")
     }
   }
 

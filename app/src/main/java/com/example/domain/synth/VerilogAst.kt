@@ -43,6 +43,8 @@ data class VerilogAlwaysBlock(
   val sensitivitySignals: List<String>,
   val statements: List<VerilogStmt>,
   val line: Int,
+  val alwaysKind: String = "always",
+  val hasStarSensitivity: Boolean = false,
 )
 
 data class VerilogModuleInstance(
@@ -52,6 +54,9 @@ data class VerilogModuleInstance(
   val positionalConnections: List<VerilogExpr>,
   val line: Int,
   val paramOverrides: Map<String, Int> = emptyMap(),
+  val positionalParamOverrides: List<Int> = emptyList(),
+  val symbolicParamOverrides: Map<String, VerilogExpr> = emptyMap(),
+  val symbolicPositionalParamOverrides: List<VerilogExpr> = emptyList(),
 )
 
 sealed interface VerilogStmt {
@@ -77,6 +82,18 @@ sealed interface VerilogStmt {
     val selector: VerilogExpr,
     val branches: List<Pair<List<VerilogExpr>, List<VerilogStmt>>>,
     val defaultBranch: List<VerilogStmt>,
+    val line: Int,
+  ) : VerilogStmt
+
+  data class Display(
+    val format: String,
+    val args: List<VerilogExpr>,
+    val line: Int,
+  ) : VerilogStmt
+
+  data class AssertStmt(
+    val cond: VerilogExpr,
+    val message: String,
     val line: Int,
   ) : VerilogStmt
 }

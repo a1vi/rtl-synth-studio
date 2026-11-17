@@ -13,7 +13,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -21,9 +24,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.LocalEdaColors
 
@@ -38,7 +44,7 @@ fun EdaSurfaceCard(
   val container = if (elevated) eda.elevatedCard else MaterialTheme.colorScheme.surface
   val border = BorderStroke(
     width = 1.dp,
-    color = eda.subtleBorder.copy(alpha = if (eda.isDark) 0.75f else 0.92f),
+    color = eda.subtleBorder.copy(alpha = if (eda.isDark) 0.9f else 0.92f),
   )
   val cardShadow = if (eda.isDark || elevated) 0.dp else 1.dp
   if (onClick != null) {
@@ -61,6 +67,141 @@ fun EdaSurfaceCard(
       modifier = modifier,
     ) {
       Column(content = content)
+    }
+  }
+}
+
+@Composable
+fun EdaPanelHeader(
+  title: String,
+  subtitle: String? = null,
+  icon: ImageVector? = null,
+  trailing: (@Composable () -> Unit)? = null,
+  modifier: Modifier = Modifier,
+) {
+  val eda = LocalEdaColors.current
+  Column(modifier = modifier.fillMaxWidth()) {
+    Row(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(horizontal = 12.dp, vertical = 9.dp),
+      horizontalArrangement = Arrangement.SpaceBetween,
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Row(
+        modifier = Modifier.weight(1f).padding(end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+      ) {
+        if (icon != null) {
+          Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(16.dp),
+          )
+        }
+        Column {
+          Text(
+            text = title.uppercase(),
+            style = MaterialTheme.typography.labelMedium.copy(
+              fontFamily = JetBrainsMonoFamily,
+              fontWeight = FontWeight.Bold,
+              letterSpacing = 0.6.sp,
+            ),
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+          )
+          if (!subtitle.isNullOrBlank()) {
+            Text(
+              text = subtitle,
+              style = MaterialTheme.typography.labelSmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+            )
+          }
+        }
+      }
+      if (trailing != null) {
+        trailing()
+      }
+    }
+    HorizontalDivider(color = eda.subtleBorder.copy(alpha = 0.75f))
+  }
+}
+
+@Composable
+fun EdaKeyValueRow(
+  label: String,
+  value: String,
+  valueColor: Color = MaterialTheme.colorScheme.onSurface,
+  modifier: Modifier = Modifier,
+) {
+  Row(
+    modifier = modifier.fillMaxWidth(),
+    horizontalArrangement = Arrangement.SpaceBetween,
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    Text(
+      text = label,
+      style = MaterialTheme.typography.bodySmall,
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
+      maxLines = 1,
+      overflow = TextOverflow.Ellipsis,
+      modifier = Modifier.weight(1f).padding(end = 10.dp),
+    )
+    Text(
+      text = value,
+      style = MaterialTheme.typography.labelMedium.copy(fontFamily = JetBrainsMonoFamily),
+      color = valueColor,
+      maxLines = 1,
+      overflow = TextOverflow.Ellipsis,
+    )
+  }
+}
+
+@Composable
+fun EdaEmptyStatePanel(
+  icon: ImageVector,
+  title: String,
+  message: String,
+  actionLabel: String? = null,
+  onAction: (() -> Unit)? = null,
+  modifier: Modifier = Modifier,
+) {
+  EdaSurfaceCard(modifier = modifier.fillMaxWidth()) {
+    Column(
+      modifier = Modifier
+        .fillMaxWidth()
+        .padding(24.dp),
+      horizontalAlignment = Alignment.CenterHorizontally,
+      verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+      Icon(
+        imageVector = icon,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.size(32.dp),
+      )
+      Text(
+        text = title,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.onSurface,
+        textAlign = TextAlign.Center,
+      )
+      Text(
+        text = message,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+      )
+      if (!actionLabel.isNullOrBlank() && onAction != null) {
+        OutlinedButton(onClick = onAction) {
+          Text(actionLabel, style = MaterialTheme.typography.labelLarge)
+        }
+      }
     }
   }
 }
@@ -152,7 +293,7 @@ fun EdaCompactMetric(
   Surface(
     color = eda.elevatedCard,
     shape = MaterialTheme.shapes.small,
-    border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = if (eda.isDark) 0.65f else 0.88f)),
+    border = BorderStroke(1.dp, eda.subtleBorder.copy(alpha = if (eda.isDark) 0.85f else 0.88f)),
     modifier = modifier,
   ) {
     Column(
